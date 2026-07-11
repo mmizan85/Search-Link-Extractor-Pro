@@ -1,0 +1,64 @@
+{
+  "manifest_version": 3,
+  "name": "Search Link Extractor Pro",
+  "version": "1.0.0",
+  "description": "Enterprise-grade search result extractor with multi-engine support, batch automation, and smart data enrichment.",
+  "permissions": [
+    "storage",
+    "activeTab",
+    "scripting",
+    "tabs"
+  ],
+  "host_permissions": [
+    "*://*.google.com/*",
+    "*://*.google.co.uk/*",
+    "*://*.google.co.in/*",
+    "*://*.google.ca/*",
+    "*://*.google.com.au/*",
+    "*://*.google.co.jp/*",
+    "*://*.google.de/*",
+    "*://*.google.fr/*",
+    "*://*.bing.com/*",
+    "*://*.search.yahoo.com/*",
+    "*://*.yahoo.com/*",
+    "*://*.duckduckgo.com/*"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Search Link Extractor Pro",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "*://*.google.com/*",
+        "*://*.google.co.uk/*",
+        "*://*.google.co.in/*",
+        "*://*.google.ca/*",
+        "*://*.google.com.au/*",
+        "*://*.google.co.jp/*",
+        "*://*.google.de/*",
+        "*://*.google.fr/*",
+        "*://*.bing.com/*",
+        "*://*.search.yahoo.com/*",
+        "*://*.yahoo.com/*",
+        "*://*.duckduckgo.com/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
