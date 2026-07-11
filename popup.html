@@ -2,199 +2,163 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>Search Link Extractor Pro</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Search Link Extractor</title>
   <link rel="stylesheet" href="style.css" />
-  <!-- External libraries for XLSX / PDF export -->
-  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js"></script>
 </head>
 <body>
-  <div class="app-shell">
-    <!-- HEADER -->
+  <div class="app">
+
+    <!-- ============ HEADER ============ -->
     <header class="app-header">
       <div class="brand">
-        <svg class="brand-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <circle cx="11" cy="11" r="7"></circle>
-          <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
-        </svg>
-        <div>
-          <h1>Search Link Extractor <span class="accent">Pro</span></h1>
-          <p class="tagline">Enterprise-Grade SERP Intelligence</p>
+        <div class="brand-icon">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
+            <path d="M9 11L20 2M20 2H14M20 2V8" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+            <path d="M20 13V19C20 19.5304 19.7893 20.0391 19.4142 20.4142C19.0391 20.7893 18.5304 21 18 21H5C4.46957 21 3.96086 20.7893 3.58579 20.4142C3.21071 20.0391 3 19.5304 3 19V6C3 5.46957 3.21071 4.96086 3.58579 4.58579C3.96086 4.21071 4.46957 4 5 4H11" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </div>
+        <div class="brand-text">
+          <h1>Link Extractor</h1>
+          <span class="brand-sub">Search Result Serializer</span>
         </div>
       </div>
-      <div id="engineBadge" class="engine-badge" title="Detected Engine">
-        <span class="dot"></span>
-        <span id="engineName">Idle</span>
+      <div class="status-badge" id="statusBadge" data-state="idle">
+        <span class="status-dot"></span>
+        <span class="status-label" id="statusLabel">Idle</span>
       </div>
     </header>
 
-    <!-- TAB NAV -->
-    <nav class="tab-nav">
-      <button class="tab-btn active" data-tab="settings">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
-        Settings
-      </button>
-      <button class="tab-btn" data-tab="batch">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4h16v4H4zM4 12h16v4H4zM4 20h10v-0"/></svg>
-        Batch
-      </button>
-      <button class="tab-btn" data-tab="results">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3h18v18H3z"/><path d="M3 9h18M9 21V9"/></svg>
-        Results
-      </button>
-      <button class="tab-btn" data-tab="history">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
-        History
-      </button>
+    <!-- ============ CONTEXT WARNING (shown when not on a Google SERP) ============ -->
+    <div class="context-warning" id="contextWarning" hidden>
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none"><path d="M12 9V13M12 17H12.01M10.29 3.86L1.82 18A2 2 0 0 0 3.54 21H20.46A2 2 0 0 0 22.18 18L13.71 3.86A2 2 0 0 0 10.29 3.86Z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <span>Open a Google Search results page to begin extraction.</span>
+    </div>
+
+    <!-- ============ TABS ============ -->
+    <nav class="tabs" role="tablist">
+      <button class="tab-btn is-active" data-tab="scrape" role="tab">Extract</button>
+      <button class="tab-btn" data-tab="results" role="tab">Results <span class="tab-count" id="resultsTabCount">0</span></button>
+      <button class="tab-btn" data-tab="history" role="tab">History</button>
     </nav>
 
-    <!-- TAB: SETTINGS -->
-    <section id="tab-settings" class="tab-panel active">
-      <div class="panel-card">
-        <h3>Scraper Configuration</h3>
-        <div class="form-row">
-          <label>Search Engine</label>
-          <select id="cfgEngine">
-            <option value="auto">Auto-Detect</option>
-            <option value="google">Google</option>
-            <option value="bing">Bing</option>
-            <option value="yahoo">Yahoo</option>
-            <option value="duckduckgo">DuckDuckGo</option>
-          </select>
+    <main class="app-body">
+
+      <!-- ============ TAB: SCRAPE / CONFIG ============ -->
+      <section class="tab-panel is-active" id="panel-scrape">
+
+        <div class="card">
+          <label class="field-label" for="domainFilter">
+            Domain / pattern filter
+            <span class="field-hint">optional</span>
+          </label>
+          <input
+            type="text"
+            id="domainFilter"
+            class="text-input"
+            placeholder="e.g. facebook.com/groups, .edu, .gov"
+            autocomplete="off"
+          />
+          <p class="field-note">Comma-separate multiple patterns. Leave blank to capture all external links.</p>
         </div>
-        <div class="form-row">
-          <label>Max Pages per Keyword</label>
-          <input type="number" id="cfgPages" min="1" max="50" value="5" />
+
+        <div class="card">
+          <div class="field-row">
+            <label class="field-label" for="maxPages">Page limit</label>
+            <span class="field-value" id="maxPagesValue">10</span>
+          </div>
+          <input type="range" id="maxPages" class="range-input" min="1" max="50" value="10" step="1" />
         </div>
-        <div class="form-row">
-          <label>Min Delay (ms)</label>
-          <input type="number" id="cfgDelayMin" min="500" max="20000" value="2000" />
+
+        <div class="card">
+          <div class="field-row">
+            <label class="field-label" for="delayRange">
+              Transition delay
+              <span class="field-hint">anti-bot pacing</span>
+            </label>
+            <span class="field-value" id="delayRangeValue">1.5s – 3.5s</span>
+          </div>
+          <input type="range" id="delayMin" class="range-input range-dual" min="500" max="8000" value="1500" step="100" />
+          <input type="range" id="delayMax" class="range-input range-dual" min="500" max="8000" value="3500" step="100" />
         </div>
-        <div class="form-row">
-          <label>Max Delay (ms)</label>
-          <input type="number" id="cfgDelayMax" min="500" max="30000" value="4500" />
+
+        <!-- ============ LIVE PROGRESS DASHBOARD ============ -->
+        <div class="progress-panel" id="progressPanel" data-active="false">
+          <div class="progress-scan-bar" id="scanBar"></div>
+          <div class="progress-grid">
+            <div class="progress-stat">
+              <span class="progress-stat-value" id="statPage">0</span>
+              <span class="progress-stat-label">Page</span>
+            </div>
+            <div class="progress-stat">
+              <span class="progress-stat-value" id="statLinks">0</span>
+              <span class="progress-stat-label">Unique links</span>
+            </div>
+            <div class="progress-stat">
+              <span class="progress-stat-value" id="statRuntime">0:00</span>
+              <span class="progress-stat-label">Runtime</span>
+            </div>
+          </div>
+          <p class="progress-phase" id="progressPhase">Waiting to start…</p>
         </div>
-        <div class="form-row">
-          <label>Blacklist Domains (comma-separated)</label>
-          <input type="text" id="cfgBlacklist" placeholder="wikipedia.org, pinterest.com" />
-        </div>
-        <div class="form-row">
-          <label>Required Keywords in Title/Snippet</label>
-          <input type="text" id="cfgKeywords" placeholder="ai, startup, tech" />
-        </div>
-        <div class="form-row checkbox-row">
-          <input type="checkbox" id="cfgEnrich" checked />
-          <label for="cfgEnrich">Enable Smart Enrichment (emails, phones, social)</label>
-        </div>
-        <div class="form-row checkbox-row">
-          <input type="checkbox" id="cfgDedup" checked />
-          <label for="cfgDedup">Enable Smart Deduplication</label>
-        </div>
-        <button id="btnSaveConfig" class="btn btn-primary">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
-          Save Configuration
+
+        <button class="cta-btn" id="ctaBtn" data-mode="start">
+          <span class="cta-icon" id="ctaIcon">▶</span>
+          <span id="ctaLabel">Start Extraction</span>
         </button>
-      </div>
-    </section>
+      </section>
 
-    <!-- TAB: BATCH -->
-    <section id="tab-batch" class="tab-panel">
-      <div class="panel-card">
-        <h3>Batch Task Scheduler</h3>
-        <div class="form-row">
-          <label>Keywords (comma-separated)</label>
-          <textarea id="batchKeywords" rows="5" placeholder="chrome extension, web scraping, manifest v3"></textarea>
-        </div>
-        <div class="form-row">
-          <label>Single Quick-Search Keyword</label>
-          <input type="text" id="quickKeyword" placeholder="Enter a single keyword..." />
-        </div>
-        <div class="action-row">
-          <button id="btnStartBatch" class="btn btn-primary btn-glow">
-            <svg class="radar-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/><line x1="12" y1="2" x2="12" y2="12"/></svg>
-            Start Batch Job
-          </button>
-          <button id="btnQuickSearch" class="btn btn-secondary">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-            Quick Search
-          </button>
-          <button id="btnStopJob" class="btn btn-danger" disabled>
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="6" y="6" width="12" height="12"/></svg>
-            Stop
-          </button>
-        </div>
-        <div id="jobStatus" class="status-bar">
-          <span class="status-dot idle"></span>
-          <span id="statusText">Ready</span>
-        </div>
-        <div id="progressWrap" class="progress-wrap hidden">
-          <div class="progress-bar">
-            <div id="progressFill" class="progress-fill" style="width: 0%"></div>
-          </div>
-          <div class="progress-meta">
-            <span id="progressLabel">0 / 0</span>
-            <span id="progressPercent">0%</span>
+      <!-- ============ TAB: RESULTS ============ -->
+      <section class="tab-panel" id="panel-results">
+        <div class="results-toolbar">
+          <span class="results-count" id="resultsCount">0 links</span>
+          <div class="export-buttons">
+            <button class="export-btn" id="exportTxt">TXT</button>
+            <button class="export-btn" id="exportCsv">CSV</button>
+            <button class="export-btn" id="exportJson">JSON</button>
+            <button class="export-btn export-btn-danger" id="clearResults">Clear</button>
           </div>
         </div>
-      </div>
-    </section>
-
-    <!-- TAB: RESULTS -->
-    <section id="tab-results" class="tab-panel">
-      <div class="panel-card">
-        <div class="results-header">
-          <h3>Extracted Dataset <span id="resultCount" class="count-pill">0</span></h3>
-          <div class="results-actions">
-            <button class="btn btn-sm btn-outline" data-export="json">JSON</button>
-            <button class="btn btn-sm btn-outline" data-export="csv">CSV</button>
-            <button class="btn btn-sm btn-outline" data-export="xlsx">XLSX</button>
-            <button class="btn btn-sm btn-outline" data-export="pdf">PDF</button>
-            <button class="btn btn-sm btn-outline" data-export="txt">TXT</button>
-            <button id="btnClearResults" class="btn btn-sm btn-danger-outline">Clear</button>
-          </div>
-        </div>
-        <div id="resultsTable" class="results-table">
+        <div class="results-list" id="resultsList">
           <div class="empty-state">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="10"/><path d="M8 12h8M12 8v8"/></svg>
-            <p>No data yet. Run a search to populate results.</p>
+            <p>No links extracted yet.</p>
+            <span>Run an extraction from the Extract tab to populate this list.</span>
           </div>
         </div>
-      </div>
-    </section>
+      </section>
 
-    <!-- TAB: HISTORY -->
-    <section id="tab-history" class="tab-panel">
-      <div class="panel-card">
-        <div class="results-header">
-          <h3>Job History</h3>
-          <button id="btnClearHistory" class="btn btn-sm btn-danger-outline">Clear History</button>
+      <!-- ============ TAB: HISTORY ============ -->
+      <section class="tab-panel" id="panel-history">
+        <div class="results-toolbar">
+          <span class="results-count">Past sessions</span>
+          <div class="export-buttons">
+            <button class="export-btn export-btn-danger" id="clearHistory">Clear log</button>
+          </div>
         </div>
-        <div id="historyList" class="history-list">
+        <div class="history-list" id="historyList">
           <div class="empty-state">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
-            <p>No past jobs recorded.</p>
+            <p>No history yet.</p>
+            <span>Completed extraction sessions will be logged here.</span>
           </div>
         </div>
-      </div>
-    </section>
+      </section>
 
-    <!-- FOOTER -->
-    <footer id="appFooter" class="app-footer">
-      <div class="footer-left">
-        <p class="dedication">Dedicated to: <span class="cyan-bold">Target User</span></p>
-        <p class="developer">Developer: <strong>Mohammed Mizanur Rahman</strong></p>
+    </main>
+
+    <footer class="app-footer" id="dedicationFooter"
+      style="padding: 12px 18px; border-top: 1px solid var(--border-glass); background: rgba(255, 255, 255, 0.02); flex-shrink: 0; cursor: pointer;">
+      <div
+        style="display: flex; justify-content: space-between; width: 100%; font-size: 11px; font-weight: 600; color: var(--text-primary); pointer-events: none;">
+        <span>Developed by <a href="https://www.li" target="_blank">Mohammod Mizan</a></span>
+        <span class="footer-version" style="color: var(--text-tertiary);">v1.0.0</span>
       </div>
-      <div class="footer-right">
-        <a href="https://www.facebook.com/" target="_blank" rel="noopener" class="fb-link">
-          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M24 12.073c0-6.627-5.373-12-12-12s-12 5.373-12 12c0 5.99 4.388 10.954 10.125 11.854v-8.385H7.078v-3.47h3.047V9.43c0-3.007 1.792-4.669 4.533-4.669 1.312 0 2.686.235 2.686.235v2.953H15.83c-1.491 0-1.956.925-1.956 1.874v2.25h3.328l-.532 3.47h-2.796v8.385C19.612 23.027 24 18.062 24 12.073z"/></svg>
-          <span>Visit Facebook Profile</span>
-        </a>
-      </div>
-      <div id="footerTooltip" class="footer-tooltip">
-        This automation tool is custom-built to serialize and enrich search engine data effortlessly.
-      </div>
+      
     </footer>
+    
+    <div id="footerTooltip" class="custom-tooltip">
+    <p>This automation tool has been specifically created to quickly serialize data from Google search engines for your convenience.</p>
+    </div>
+
   </div>
 
   <script src="popup.js"></script>

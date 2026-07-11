@@ -1,351 +1,253 @@
-/* ============================================================
-   BACKGROUND SERVICE WORKER — TaskScheduler
-   Manages batch jobs, coordinates popup <-> content script,
-   persists state to chrome.storage.local.
-   ============================================================ */
+/**
+ * background.js (Service Worker)
+ *
+ * Responsibilities:
+ *  - Relay start/stop commands from popup.js to content.js on the active Google tab
+ *  - Receive scraped result batches + progress events from content.js (which may
+ *    survive across page-navigation-induced context destruction) and persist them
+ *    so the popup can read current state at any time, even if it was closed mid-scrape
+ *  - Maintain the "current session" dataset (results array) in chrome.storage.local
+ *  - Maintain a lightweight History Dashboard log of past completed sessions
+ *  - Forward live progress events to the popup (when open) via runtime messaging
+ */
 
 'use strict';
 
-class StateStore {
-  constructor() {
-    this.defaults = {
-      config: {
-        engine: 'auto',
-        maxPages: 5,
-        delayMin: 2000,
-        delayMax: 4500,
-        blacklist: '',
-        requiredKeywords: '',
-        enrich: true,
-        dedup: true
-      },
-      results: [],
-      history: [],
-      activeJob: null
-    };
-  }
+const STORAGE_KEYS = {
+  CURRENT_RESULTS: 'sle_current_results',
+  CURRENT_META: 'sle_current_meta',
+  HISTORY: 'sle_history'
+};
 
-  async get(key) {
-    try {
-      const data = await chrome.storage.local.get(key);
-      return data[key] !== undefined ? data[key] : this.defaults[key];
-    } catch (err) {
-      console.error('[BG] StateStore.get error:', err);
-      return this.defaults[key];
-    }
-  }
+const MAX_HISTORY_ENTRIES = 25;
 
-  async set(key, value) {
-    try {
-      await chrome.storage.local.set({ [key]: value });
-      return true;
-    } catch (err) {
-      console.error('[BG] StateStore.set error:', err);
-      return false;
-    }
-  }
+// -----------------------------------------------------------------------
+// Utility: safe storage helpers
+// -----------------------------------------------------------------------
 
-  async update(partial) {
-    try {
-      await chrome.storage.local.set(partial);
-      return true;
-    } catch (err) {
-      console.error('[BG] StateStore.update error:', err);
-      return false;
-    }
-  }
+async function getCurrentResults() {
+  const data = await chrome.storage.local.get(STORAGE_KEYS.CURRENT_RESULTS);
+  return Array.isArray(data[STORAGE_KEYS.CURRENT_RESULTS]) ? data[STORAGE_KEYS.CURRENT_RESULTS] : [];
 }
 
-class TaskScheduler {
-  constructor() {
-    this.store = new StateStore();
-    this.running = false;
-    this.aborted = false;
-    this.activeTabId = null;
-    this.currentJob = null;
-  }
+async function setCurrentResults(results) {
+  await chrome.storage.local.set({ [STORAGE_KEYS.CURRENT_RESULTS]: results });
+}
 
-  async ensureTab(url) {
-    try {
-      const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
-      if (tabs[0]) {
-        await chrome.tabs.update(tabs[0].id, { url, active: true });
-        this.activeTabId = tabs[0].id;
-        await this.waitForTabLoad(tabs[0].id);
-        return tabs[0].id;
-      } else {
-        const tab = await chrome.tabs.create({ url, active: true });
-        this.activeTabId = tab.id;
-        await this.waitForTabLoad(tab.id);
-        return tab.id;
-      }
-    } catch (err) {
-      console.error('[BG] ensureTab error:', err);
-      throw err;
+async function getCurrentMeta() {
+  const data = await chrome.storage.local.get(STORAGE_KEYS.CURRENT_META);
+  return data[STORAGE_KEYS.CURRENT_META] || null;
+}
+
+async function setCurrentMeta(meta) {
+  await chrome.storage.local.set({ [STORAGE_KEYS.CURRENT_META]: meta });
+}
+
+async function appendHistoryEntry(entry) {
+  const data = await chrome.storage.local.get(STORAGE_KEYS.HISTORY);
+  const history = Array.isArray(data[STORAGE_KEYS.HISTORY]) ? data[STORAGE_KEYS.HISTORY] : [];
+  history.unshift(entry);
+  while (history.length > MAX_HISTORY_ENTRIES) history.pop();
+  await chrome.storage.local.set({ [STORAGE_KEYS.HISTORY]: history });
+}
+
+/** Forward a message to the popup if it's currently open. Failures are expected/ignored. */
+function forwardToPopup(message) {
+  chrome.runtime.sendMessage(message).catch(() => {
+    // No popup listening right now - that's fine, state is already persisted.
+  });
+}
+
+// -----------------------------------------------------------------------
+// Message handling
+// -----------------------------------------------------------------------
+
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (!message || !message.type) return;
+
+  switch (message.type) {
+    // ---- Commands relayed from popup -> active tab's content script ----
+    case 'SLE_POPUP_START': {
+      handlePopupStart(message.payload).then(sendResponse);
+      return true; // keep channel open for async response
     }
-  }
 
-  waitForTabLoad(tabId, timeoutMs = 30000) {
-    return new Promise((resolve, reject) => {
-      const start = Date.now();
-      const listener = (updatedId, changeInfo) => {
-        if (updatedId === tabId && changeInfo.status === 'complete') {
-          chrome.tabs.onUpdated.removeListener(listener);
-          setTimeout(resolve, 800);
-        }
-        if (Date.now() - start > timeoutMs) {
-          chrome.tabs.onUpdated.removeListener(listener);
-          reject(new Error('Tab load timeout'));
-        }
-      };
-      chrome.tabs.onUpdated.addListener(listener);
-      chrome.tabs.get(tabId).then(tab => {
-        if (tab.status === 'complete') {
-          chrome.tabs.onUpdated.removeListener(listener);
-          setTimeout(resolve, 400);
-        }
-      }).catch(() => {});
-    });
-  }
-
-  async sendMessageToTab(tabId, message, timeoutMs = 120000) {
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        reject(new Error('Content script response timeout'));
-      }, timeoutMs);
-      try {
-        chrome.tabs.sendMessage(tabId, message, (response) => {
-          clearTimeout(timer);
-          if (chrome.runtime.lastError) {
-            reject(new Error(chrome.runtime.lastError.message));
-          } else {
-            resolve(response);
-          }
-        });
-      } catch (err) {
-        clearTimeout(timer);
-        reject(err);
-      }
-    });
-  }
-
-  buildSearchUrl(engine, keyword) {
-    const q = encodeURIComponent(keyword);
-    switch (engine) {
-      case 'google':       return `https://www.google.com/search?q=${q}`;
-      case 'bing':         return `https://www.bing.com/search?q=${q}`;
-      case 'yahoo':        return `https://search.yahoo.com/search?p=${q}`;
-      case 'duckduckgo':   return `https://duckduckgo.com/?q=${q}`;
-      default:             return `https://www.google.com/search?q=${q}`;
+    case 'SLE_POPUP_STOP': {
+      handlePopupStop().then(sendResponse);
+      return true;
     }
-  }
 
-  async runBatch(keywords, config) {
-    if (this.running) throw new Error('A job is already running.');
-    this.running = true;
-    this.aborted = false;
-    const effectiveEngine = config.engine === 'auto' ? 'google' : config.engine;
-    const allResults = [];
-    const jobStartedAt = new Date().toISOString();
-    this.currentJob = {
-      id: `job_${Date.now()}`,
-      keywords,
-      engine: effectiveEngine,
-      startedAt: jobStartedAt,
-      totalKeywords: keywords.length,
-      completedKeywords: 0,
-      resultsCount: 0
-    };
-    await this.store.set('activeJob', this.currentJob);
-    this.broadcast({ type: 'JOB_STARTED', job: this.currentJob });
+    case 'SLE_POPUP_GET_STATE': {
+      handleGetState().then(sendResponse);
+      return true;
+    }
 
-    try {
-      for (let i = 0; i < keywords.length; i++) {
-        if (this.aborted) break;
-        const kw = keywords[i].trim();
-        if (!kw) continue;
-        this.currentJob.currentKeyword = kw;
-        this.broadcast({ type: 'KEYWORD_START', keyword: kw, index: i, total: keywords.length });
-        const url = this.buildSearchUrl(effectiveEngine, kw);
-        let tabId;
-        try {
-          tabId = await this.ensureTab(url);
-        } catch (err) {
-          console.warn('[BG] tab navigation failed:', err);
-          this.broadcast({ type: 'KEYWORD_ERROR', keyword: kw, error: err.message });
-          continue;
-        }
-        const scrapeConfig = {
-          ...config,
-          engine: effectiveEngine,
-          currentKeyword: kw
-        };
-        try {
-          const response = await this.sendMessageToTab(tabId, {
-            type: 'START_SCRAPE',
-            config: scrapeConfig
-          });
-          if (response && response.success) {
-            allResults.push(...(response.results || []));
-            await this.store.set('results', allResults);
-            this.currentJob.resultsCount = allResults.length;
-            this.broadcast({
-              type: 'KEYWORD_DONE',
-              keyword: kw,
-              found: (response.results || []).length,
-              total: allResults.length
-            });
-          } else {
-            this.broadcast({
-              type: 'KEYWORD_ERROR',
-              keyword: kw,
-              error: response?.error || 'Unknown scrape error'
-            });
-          }
-        } catch (err) {
-          console.warn('[BG] scrape failed for keyword:', kw, err);
-          this.broadcast({ type: 'KEYWORD_ERROR', keyword: kw, error: err.message });
-        }
-        this.currentJob.completedKeywords = i + 1;
-        await this.store.set('activeJob', this.currentJob);
-        if (i < keywords.length - 1 && !this.aborted) {
-          const interDelay = 2000 + Math.floor(Math.random() * 2000);
-          this.broadcast({ type: 'WAITING', ms: interDelay, reason: 'inter-keyword delay' });
-          await this.sleep(interDelay);
-        }
-      }
-      const historyEntry = {
-        id: this.currentJob.id,
-        startedAt: jobStartedAt,
-        finishedAt: new Date().toISOString(),
-        keywords,
-        engine: effectiveEngine,
-        resultsCount: allResults.length,
-        aborted: this.aborted
-      };
-      const history = await this.store.get('history');
-      history.unshift(historyEntry);
-      if (history.length > 50) history.length = 50;
-      await this.store.set('history', history);
-      await this.store.set('activeJob', null);
-      this.broadcast({
-        type: 'JOB_COMPLETE',
-        job: historyEntry,
-        resultsCount: allResults.length
+    case 'SLE_POPUP_CLEAR': {
+      handleClear().then(sendResponse);
+      return true;
+    }
+
+    // ---- Events coming up from content.js ----
+    case 'SLE_RESULTS_BATCH': {
+      handleResultsBatch(message.payload).then(() => {
+        if (sendResponse) sendResponse({ ok: true });
       });
-    } catch (err) {
-      console.error('[BG] batch error:', err);
-      this.broadcast({ type: 'JOB_ERROR', error: err.message });
-    } finally {
-      this.running = false;
-      this.currentJob = null;
-    }
-  }
-
-  async stop() {
-    this.aborted = true;
-    if (this.activeTabId) {
-      try {
-        await chrome.tabs.sendMessage(this.activeTabId, { type: 'STOP_SCRAPE' });
-      } catch (_) {}
-    }
-    this.broadcast({ type: 'JOB_STOPPED' });
-  }
-
-  broadcast(msg) {
-    try {
-      chrome.runtime.sendMessage(msg).catch(() => {});
-    } catch (_) {}
-  }
-
-  sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
-  }
-}
-
-const scheduler = new TaskScheduler();
-
-/* ============================================================
-   MESSAGE HANDLERS
-   ============================================================ */
-chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  try {
-    if (msg.type === 'GET_STATE') {
-      (async () => {
-        const [config, results, history, activeJob] = await Promise.all([
-          scheduler.store.get('config'),
-          scheduler.store.get('results'),
-          scheduler.store.get('history'),
-          scheduler.store.get('activeJob')
-        ]);
-        sendResponse({ config, results, history, activeJob, running: scheduler.running });
-      })();
       return true;
     }
 
-    if (msg.type === 'SAVE_CONFIG') {
-      (async () => {
-        await scheduler.store.set('config', msg.config);
-        sendResponse({ ok: true });
-      })();
-      return true;
+    case 'SLE_PROGRESS': {
+      handleProgress(message.payload);
+      forwardToPopup({ type: 'SLE_PROGRESS_RELAY', payload: message.payload });
+      break;
     }
 
-    if (msg.type === 'START_BATCH') {
-      (async () => {
-        try {
-          const config = await scheduler.store.get('config');
-          const merged = { ...config, ...(msg.config || {}) };
-          scheduler.runBatch(msg.keywords, merged).catch(err => {
-            scheduler.broadcast({ type: 'JOB_ERROR', error: err.message });
-          });
-          sendResponse({ ok: true });
-        } catch (err) {
-          sendResponse({ ok: false, error: err.message });
-        }
-      })();
-      return true;
+    case 'SLE_SCRAPE_COMPLETE': {
+      handleScrapeComplete(message.payload).then(() => {
+        forwardToPopup({ type: 'SLE_SCRAPE_COMPLETE_RELAY', payload: message.payload });
+      });
+      break;
     }
 
-    if (msg.type === 'STOP_JOB') {
-      scheduler.stop().then(() => sendResponse({ ok: true }));
-      return true;
-    }
-
-    if (msg.type === 'CLEAR_RESULTS') {
-      (async () => {
-        await scheduler.store.set('results', []);
-        sendResponse({ ok: true });
-      })();
-      return true;
-    }
-
-    if (msg.type === 'CLEAR_HISTORY') {
-      (async () => {
-        await scheduler.store.set('history', []);
-        sendResponse({ ok: true });
-      })();
-      return true;
-    }
-
-    if (msg.type === 'APPEND_RESULTS') {
-      (async () => {
-        const existing = await scheduler.store.get('results');
-        const merged = [...existing, ...(msg.results || [])];
-        await scheduler.store.set('results', merged);
-        sendResponse({ ok: true, total: merged.length });
-      })();
-      return true;
-    }
-
-    if (msg.type === 'CONTENT_READY' || msg.type === 'ENGINE_DETECTED' || msg.type === 'SCRAPE_PROGRESS') {
-      scheduler.broadcast(msg);
-      sendResponse({ ok: true });
-      return true;
-    }
-  } catch (err) {
-    console.error('[BG] handler error:', err);
-    sendResponse({ ok: false, error: err.message });
-    return true;
+    default:
+      break;
   }
 });
+
+// -----------------------------------------------------------------------
+// Handlers
+// -----------------------------------------------------------------------
+
+async function getActiveGoogleSearchTab() {
+  const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+  const tab = tabs && tabs[0];
+  if (!tab || !tab.url || !/^https:\/\/www\.google\.[a-z.]+\/search/i.test(tab.url)) {
+    return null;
+  }
+  return tab;
+}
+
+async function handlePopupStart(payload) {
+  const tab = await getActiveGoogleSearchTab();
+  if (!tab) {
+    return { ok: false, error: 'NOT_ON_GOOGLE_SEARCH' };
+  }
+
+  // Fresh session: clear previous results/meta
+  await setCurrentResults([]);
+  await setCurrentMeta({
+    running: true,
+    startTime: Date.now(),
+    domainFilter: payload?.domainFilter || '',
+    maxPages: payload?.maxPages || 10,
+    minDelayMs: payload?.minDelayMs ?? 1500,
+    maxDelayMs: payload?.maxDelayMs ?? 3500,
+    currentPage: 1,
+    totalUnique: 0
+  });
+
+  try {
+    const response = await chrome.tabs.sendMessage(tab.id, {
+      type: 'SLE_START_SCRAPE',
+      payload
+    });
+    return { ok: true, response };
+  } catch (err) {
+    return { ok: false, error: 'CONTENT_SCRIPT_UNREACHABLE', detail: String(err) };
+  }
+}
+
+async function handlePopupStop() {
+  const tab = await getActiveGoogleSearchTab();
+  const meta = await getCurrentMeta();
+  if (meta) {
+    meta.running = false;
+    await setCurrentMeta(meta);
+  }
+  if (!tab) {
+    return { ok: true, note: 'No active Google Search tab; local state marked stopped.' };
+  }
+  try {
+    await chrome.tabs.sendMessage(tab.id, { type: 'SLE_STOP_SCRAPE' });
+    return { ok: true };
+  } catch (err) {
+    return { ok: true, note: 'Tab unreachable, local state marked stopped.' };
+  }
+}
+
+async function handleGetState() {
+  const [results, meta, historyData] = await Promise.all([
+    getCurrentResults(),
+    getCurrentMeta(),
+    chrome.storage.local.get(STORAGE_KEYS.HISTORY)
+  ]);
+  return {
+    ok: true,
+    results,
+    meta,
+    history: Array.isArray(historyData[STORAGE_KEYS.HISTORY]) ? historyData[STORAGE_KEYS.HISTORY] : []
+  };
+}
+
+async function handleClear() {
+  await setCurrentResults([]);
+  await setCurrentMeta(null);
+  return { ok: true };
+}
+
+async function handleResultsBatch(payload) {
+  if (!payload || !Array.isArray(payload.results)) return;
+  const existing = await getCurrentResults();
+
+  // Re-check dedup at the aggregation layer too, in case of any race across
+  // a navigation boundary where content.js's in-memory Set was reset.
+  const seen = new Set(existing.map((r) => r.url.toLowerCase()));
+  const merged = existing.slice();
+
+  for (const r of payload.results) {
+    const key = r.url.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push({
+      serial: merged.length + 1,
+      url: r.url,
+      title: r.title,
+      snippet: r.snippet,
+      page: payload.page
+    });
+  }
+
+  await setCurrentResults(merged);
+
+  const meta = (await getCurrentMeta()) || {};
+  meta.totalUnique = merged.length;
+  meta.currentPage = payload.page;
+  await setCurrentMeta(meta);
+
+  forwardToPopup({
+    type: 'SLE_RESULTS_UPDATED_RELAY',
+    payload: { totalUnique: merged.length, page: payload.page }
+  });
+}
+
+async function handleProgress(payload) {
+  const meta = (await getCurrentMeta()) || {};
+  Object.assign(meta, payload);
+  await setCurrentMeta(meta);
+}
+
+async function handleScrapeComplete(payload) {
+  const meta = (await getCurrentMeta()) || {};
+  meta.running = false;
+  meta.endTime = Date.now();
+  meta.completionReason = payload?.reason || 'unknown';
+  await setCurrentMeta(meta);
+
+  const results = await getCurrentResults();
+  await appendHistoryEntry({
+    timestamp: Date.now(),
+    totalUnique: results.length,
+    totalPages: payload?.totalPages || meta.currentPage || 1,
+    domainFilter: meta.domainFilter || '',
+    completionReason: payload?.reason || 'unknown'
+  });
+}

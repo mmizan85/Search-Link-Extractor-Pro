@@ -1,639 +1,554 @@
-/* ============================================================
-   POPUP SCRIPT — UIController + ExportManager
-   Handles all UI interactions, tab switching, live status,
-   and multi-format export.
-   ============================================================ */
+/**
+ * popup.js
+ * Drives the popup UI: tab switching, config inputs, start/stop control,
+ * live progress rendering, results list rendering, history rendering,
+ * and CSV/JSON export.
+ *
+ * All durable state lives in background.js / chrome.storage.local so the
+ * popup can be closed and reopened mid-scrape without losing data.
+ */
 
-'use strict';
+(() => {
+  'use strict';
 
-class ExportManager {
-  static sanitizeFilename(name) {
-    return (name || 'extract').replace(/[^a-z0-9_\-]/gi, '_').slice(0, 60);
+  // ---------------------------------------------------------------------
+  // Element refs
+  // ---------------------------------------------------------------------
+
+  const el = {
+    statusBadge: document.getElementById('statusBadge'),
+    statusLabel: document.getElementById('statusLabel'),
+    contextWarning: document.getElementById('contextWarning'),
+
+    tabs: Array.from(document.querySelectorAll('.tab-btn')),
+    panels: {
+      scrape: document.getElementById('panel-scrape'),
+      results: document.getElementById('panel-results'),
+      history: document.getElementById('panel-history')
+    },
+    resultsTabCount: document.getElementById('resultsTabCount'),
+
+    domainFilter: document.getElementById('domainFilter'),
+    maxPages: document.getElementById('maxPages'),
+    maxPagesValue: document.getElementById('maxPagesValue'),
+    delayMin: document.getElementById('delayMin'),
+    delayMax: document.getElementById('delayMax'),
+    delayRangeValue: document.getElementById('delayRangeValue'),
+
+    progressPanel: document.getElementById('progressPanel'),
+    statPage: document.getElementById('statPage'),
+    statLinks: document.getElementById('statLinks'),
+    statRuntime: document.getElementById('statRuntime'),
+    progressPhase: document.getElementById('progressPhase'),
+
+    ctaBtn: document.getElementById('ctaBtn'),
+    ctaIcon: document.getElementById('ctaIcon'),
+    ctaLabel: document.getElementById('ctaLabel'),
+
+    resultsCount: document.getElementById('resultsCount'),
+    resultsList: document.getElementById('resultsList'),
+    exportTxt: document.getElementById('exportTxt'),
+    exportCsv: document.getElementById('exportCsv'),
+    exportJson: document.getElementById('exportJson'),
+    clearResults: document.getElementById('clearResults'),
+
+    historyList: document.getElementById('historyList'),
+    clearHistory: document.getElementById('clearHistory')
+  };
+
+  let runtimeTimer = null;
+  let cachedResults = [];
+
+  // ---------------------------------------------------------------------
+  // Tab switching
+  // ---------------------------------------------------------------------
+
+  el.tabs.forEach((btn) => {
+    btn.addEventListener('click', () => {
+      el.tabs.forEach((b) => b.classList.remove('is-active'));
+      btn.classList.add('is-active');
+      Object.values(el.panels).forEach((p) => p.classList.remove('is-active'));
+      el.panels[btn.dataset.tab].classList.add('is-active');
+    });
+  });
+
+  // ---------------------------------------------------------------------
+  // Config inputs (sliders) — live label updates
+  // ---------------------------------------------------------------------
+
+  el.maxPages.addEventListener('input', () => {
+    el.maxPagesValue.textContent = el.maxPages.value;
+  });
+
+  function formatSeconds(ms) {
+    return (ms / 1000).toFixed(1).replace(/\.0$/, '') + 's';
   }
 
-  static downloadBlob(blob, filename) {
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    setTimeout(() => {
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
-    }, 200);
+  function updateDelayLabel() {
+    let lo = parseInt(el.delayMin.value, 10);
+    let hi = parseInt(el.delayMax.value, 10);
+    // Keep min <= max for sane UX; swap display order rather than fighting the user's drag
+    if (lo > hi) [lo, hi] = [hi, lo];
+    el.delayRangeValue.textContent = `${formatSeconds(lo)} – ${formatSeconds(hi)}`;
   }
 
-  static exportJSON(data) {
-    try {
-      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-      this.downloadBlob(blob, `${this.sanitizeFilename()}_${Date.now()}.json`);
-      return true;
-    } catch (err) {
-      console.error('[EXPORT] JSON error:', err);
-      return false;
+  el.delayMin.addEventListener('input', updateDelayLabel);
+  el.delayMax.addEventListener('input', updateDelayLabel);
+
+  // ---------------------------------------------------------------------
+  // Toast helper
+  // ---------------------------------------------------------------------
+
+  function showToast(message, variant = 'default') {
+    let toast = document.querySelector('.toast');
+    if (!toast) {
+      toast = document.createElement('div');
+      toast.className = 'toast';
+      document.body.appendChild(toast);
     }
+    toast.textContent = message;
+    toast.classList.remove('is-error', 'is-success');
+    if (variant === 'error') toast.classList.add('is-error');
+    if (variant === 'success') toast.classList.add('is-success');
+    toast.classList.add('is-visible');
+    clearTimeout(toast._hideTimer);
+    toast._hideTimer = setTimeout(() => toast.classList.remove('is-visible'), 2400);
   }
 
-  static exportCSV(data) {
-    try {
-      if (!data.length) throw new Error('No data');
-      const headers = ['title', 'url', 'snippet', 'engine', 'page', 'keyword', 'emails', 'phones', 'social', 'extractedAt'];
-      const escape = (v) => {
-        if (v === null || v === undefined) return '';
-        const s = typeof v === 'object' ? JSON.stringify(v) : String(v);
-        return `"${s.replace(/"/g, '""')}"`;
-      };
-      const rows = [headers.join(',')];
-      data.forEach(r => {
-        rows.push(headers.map(h => escape(r[h])).join(','));
-      });
-      const blob = new Blob(['\uFEFF' + rows.join('\r\n')], { type: 'text/csv;charset=utf-8' });
-      this.downloadBlob(blob, `${this.sanitizeFilename()}_${Date.now()}.csv`);
-      return true;
-    } catch (err) {
-      console.error('[EXPORT] CSV error:', err);
-      return false;
-    }
-  }
+  // ---------------------------------------------------------------------
+  // Background messaging helpers
+  // ---------------------------------------------------------------------
 
-  static exportTXT(data) {
-    try {
-      const lines = data.map((r, i) => {
-        return [
-          `[${i + 1}] ${r.title}`,
-          `    URL: ${r.url}`,
-          `    Engine: ${r.engine} | Page: ${r.page} | Keyword: ${r.keyword}`,
-          r.snippet ? `    Snippet: ${r.snippet}` : '',
-          r.emails?.length ? `    Emails: ${r.emails.join(', ')}` : '',
-          r.phones?.length ? `    Phones: ${r.phones.join(', ')}` : '',
-          r.social && Object.keys(r.social).length ? `    Social: ${JSON.stringify(r.social)}` : '',
-          ''
-        ].filter(Boolean).join('\n');
-      });
-      const blob = new Blob([lines.join('\n\n')], { type: 'text/plain;charset=utf-8' });
-      this.downloadBlob(blob, `${this.sanitizeFilename()}_${Date.now()}.txt`);
-      return true;
-    } catch (err) {
-      console.error('[EXPORT] TXT error:', err);
-      return false;
-    }
-  }
-
-  static exportXLSX(data) {
-    try {
-      if (typeof XLSX === 'undefined') throw new Error('XLSX library not loaded');
-      const rows = data.map(r => ({
-        Title: r.title || '',
-        URL: r.url || '',
-        Snippet: r.snippet || '',
-        Engine: r.engine || '',
-        Page: r.page || '',
-        Keyword: r.keyword || '',
-        Emails: (r.emails || []).join('; '),
-        Phones: (r.phones || []).join('; '),
-        Social: r.social ? Object.entries(r.social).map(([k, v]) => `${k}: ${v.join(',')}`).join(' | ') : '',
-        Extracted: r.extractedAt || ''
-      }));
-      const ws = XLSX.utils.json_to_sheet(rows);
-      const wb = XLSX.utils.book_new();
-      XLSX.utils.book_append_sheet(wb, ws, 'Results');
-      XLSX.writeFile(wb, `${this.sanitizeFilename()}_${Date.now()}.xlsx`);
-      return true;
-    } catch (err) {
-      console.error('[EXPORT] XLSX error:', err);
-      alert('XLSX export failed: ' + err.message);
-      return false;
-    }
-  }
-
-  static exportPDF(data) {
-    try {
-      if (typeof window.jspdf === 'undefined' && typeof jspdf === 'undefined') {
-        throw new Error('jsPDF library not loaded');
-      }
-      const { jsPDF } = window.jspdf || jspdf;
-      const doc = new jsPDF({ orientation: 'landscape', unit: 'pt', format: 'a4' });
-      doc.setFontSize(16);
-      doc.setTextColor(0, 168, 255);
-      doc.text('Search Link Extractor Pro — Report', 40, 40);
-      doc.setFontSize(9);
-      doc.setTextColor(100);
-      doc.text(`Generated: ${new Date().toLocaleString()} | Total Records: ${data.length}`, 40, 58);
-      const rows = data.map((r, i) => [
-        i + 1,
-        (r.title || '').slice(0, 50),
-        (r.url || '').slice(0, 60),
-        r.engine || '',
-        r.keyword || '',
-        (r.emails || []).join(', ').slice(0, 40)
-      ]);
-      doc.autoTable({
-        head: [['#', 'Title', 'URL', 'Engine', 'Keyword', 'Emails']],
-        body: rows,
-        startY: 75,
-        styles: { fontSize: 8, cellPadding: 4, overflow: 'linebreak' },
-        headStyles: { fillColor: [0, 168, 255], textColor: 255 },
-        alternateRowStyles: { fillColor: [245, 248, 252] },
-        columnStyles: {
-          0: { cellWidth: 30 },
-          1: { cellWidth: 170 },
-          2: { cellWidth: 220 },
-          3: { cellWidth: 60 },
-          4: { cellWidth: 90 },
-          5: { cellWidth: 140 }
-        }
-      });
-      doc.save(`${this.sanitizeFilename()}_${Date.now()}.pdf`);
-      return true;
-    } catch (err) {
-      console.error('[EXPORT] PDF error:', err);
-      alert('PDF export failed: ' + err.message);
-      return false;
-    }
-  }
-
-  static export(format, data) {
-    switch (format) {
-      case 'json': return this.exportJSON(data);
-      case 'csv':  return this.exportCSV(data);
-      case 'txt':  return this.exportTXT(data);
-      case 'xlsx': return this.exportXLSX(data);
-      case 'pdf':  return this.exportPDF(data);
-      default: return false;
-    }
-  }
-}
-
-class UIController {
-  constructor() {
-    this.currentTab = 'settings';
-    this.results = [];
-    this.history = [];
-    this.config = {};
-    this.running = false;
-    this.tooltipEl = null;
-    this.footerEl = null;
-    this.init();
-  }
-
-  async init() {
-    try {
-      this.cacheElements();
-      this.bindTabs();
-      this.bindActions();
-      this.bindFooterTooltip();
-      await this.loadState();
-      this.renderConfig();
-      this.renderResults();
-      this.renderHistory();
-      this.listenForUpdates();
-      this.detectEngine();
-    } catch (err) {
-      console.error('[UI] init error:', err);
-    }
-  }
-
-  cacheElements() {
-    this.$ = (sel) => document.querySelector(sel);
-    this.$$ = (sel) => document.querySelectorAll(sel);
-    this.tooltipEl = this.$('#footerTooltip');
-    this.footerEl = this.$('#appFooter');
-  }
-
-  bindTabs() {
-    this.$$('.tab-btn').forEach(btn => {
-      btn.addEventListener('click', () => {
-        const tab = btn.dataset.tab;
-        this.$$('.tab-btn').forEach(b => b.classList.remove('active'));
-        this.$$('.tab-panel').forEach(p => p.classList.remove('active'));
-        btn.classList.add('active');
-        this.$(`#tab-${tab}`).classList.add('active');
-        this.currentTab = tab;
-      });
+  function sendToBackground(message) {
+    return chrome.runtime.sendMessage(message).catch((err) => {
+      console.warn('[popup] background message failed', err);
+      return { ok: false, error: String(err) };
     });
   }
 
-  bindActions() {
-    this.$('#btnSaveConfig').addEventListener('click', () => this.saveConfig());
-    this.$('#btnStartBatch').addEventListener('click', () => this.startBatch());
-    this.$('#btnQuickSearch').addEventListener('click', () => this.quickSearch());
-    this.$('#btnStopJob').addEventListener('click', () => this.stopJob());
-    this.$('#btnClearResults').addEventListener('click', () => this.clearResults());
-    this.$('#btnClearHistory').addEventListener('click', () => this.clearHistory());
-    this.$$('[data-export]').forEach(btn => {
-      btn.addEventListener('click', () => {
-        const fmt = btn.dataset.export;
-        if (!this.results.length) {
-          alert('No data to export.');
-          return;
-        }
-        ExportManager.export(fmt, this.results);
-      });
-    });
+  // ---------------------------------------------------------------------
+  // Status badge / CTA state rendering
+  // ---------------------------------------------------------------------
+
+  function setStatus(state, label) {
+    el.statusBadge.dataset.state = state;
+    el.statusLabel.textContent = label;
   }
 
-  bindFooterTooltip() {
-    if (!this.footerEl || !this.tooltipEl) return;
-    this.footerEl.addEventListener('mouseenter', () => {
-      this.tooltipEl.classList.add('visible');
-    });
-    this.footerEl.addEventListener('mouseleave', () => {
-      this.tooltipEl.classList.remove('visible');
-    });
-    this.footerEl.addEventListener('mousemove', (e) => {
-      try {
-        const rect = this.footerEl.getBoundingClientRect();
-        let x = e.clientX;
-        let y = e.clientY;
-        const ttWidth = this.tooltipEl.offsetWidth;
-        const half = ttWidth / 2;
-        if (x - half < 8) x = half + 8;
-        if (x + half > window.innerWidth - 8) x = window.innerWidth - half - 8;
-        this.tooltipEl.style.left = `${x}px`;
-        this.tooltipEl.style.top = `${y}px`;
-      } catch (err) {
-        console.warn('[UI] tooltip move error:', err);
-      }
-    });
-  }
+  function setRunningUI(isRunning) {
+    el.ctaBtn.dataset.mode = isRunning ? 'stop' : 'start';
+    el.ctaIcon.textContent = isRunning ? '■' : '▶';
+    el.ctaLabel.textContent = isRunning ? 'Stop Extraction' : 'Start Extraction';
+    el.progressPanel.dataset.active = isRunning ? 'true' : 'false';
 
-  async loadState() {
-    try {
-      const state = await this.sendToBackground({ type: 'GET_STATE' });
-      if (!state) return;
-      this.config = state.config || {};
-      this.results = state.results || [];
-      this.history = state.history || [];
-      this.running = !!state.running;
-      this.updateJobUI();
-    } catch (err) {
-      console.error('[UI] loadState error:', err);
-    }
-  }
+    el.domainFilter.disabled = isRunning;
+    el.maxPages.disabled = isRunning;
+    el.delayMin.disabled = isRunning;
+    el.delayMax.disabled = isRunning;
 
-  renderConfig() {
-    const c = this.config;
-    const setVal = (id, v) => {
-      const el = this.$(id);
-      if (!el) return;
-      if (el.type === 'checkbox') el.checked = !!v;
-      else el.value = v ?? '';
-    };
-    setVal('#cfgEngine', c.engine);
-    setVal('#cfgPages', c.maxPages);
-    setVal('#cfgDelayMin', c.delayMin);
-    setVal('#cfgDelayMax', c.delayMax);
-    setVal('#cfgBlacklist', c.blacklist);
-    setVal('#cfgKeywords', c.requiredKeywords);
-    setVal('#cfgEnrich', c.enrich);
-    setVal('#cfgDedup', c.dedup);
-  }
-
-  readConfigFromForm() {
-    return {
-      engine: this.$('#cfgEngine').value,
-      maxPages: parseInt(this.$('#cfgPages').value, 10) || 5,
-      delayMin: parseInt(this.$('#cfgDelayMin').value, 10) || 2000,
-      delayMax: parseInt(this.$('#cfgDelayMax').value, 10) || 4500,
-      blacklist: this.$('#cfgBlacklist').value,
-      requiredKeywords: this.$('#cfgKeywords').value,
-      enrich: this.$('#cfgEnrich').checked,
-      dedup: this.$('#cfgDedup').checked
-    };
-  }
-
-  async saveConfig() {
-    try {
-      const cfg = this.readConfigFromForm();
-      await this.sendToBackground({ type: 'SAVE_CONFIG', config: cfg });
-      this.config = cfg;
-      this.flashStatus('Configuration saved', 'success');
-    } catch (err) {
-      console.error('[UI] saveConfig error:', err);
-      this.flashStatus('Save failed: ' + err.message, 'error');
-    }
-  }
-
-  async startBatch() {
-    try {
-      if (this.running) {
-        alert('A job is already running.');
-        return;
-      }
-      const raw = this.$('#batchKeywords').value.trim();
-      if (!raw) {
-        alert('Please enter at least one keyword.');
-        return;
-      }
-      const keywords = raw.split(',').map(k => k.trim()).filter(Boolean);
-      if (!keywords.length) {
-        alert('No valid keywords found.');
-        return;
-      }
-      await this.saveConfig();
-      await this.sendToBackground({ type: 'START_BATCH', keywords });
-      this.running = true;
-      this.updateJobUI();
-      this.flashStatus(`Batch started: ${keywords.length} keyword(s)`, 'running');
-    } catch (err) {
-      console.error('[UI] startBatch error:', err);
-      this.flashStatus('Start failed: ' + err.message, 'error');
-    }
-  }
-
-  async quickSearch() {
-    try {
-      const kw = this.$('#quickKeyword').value.trim();
-      if (!kw) {
-        alert('Enter a keyword for quick search.');
-        return;
-      }
-      if (this.running) {
-        alert('A job is already running.');
-        return;
-      }
-      await this.saveConfig();
-      await this.sendToBackground({ type: 'START_BATCH', keywords: [kw] });
-      this.running = true;
-      this.updateJobUI();
-      this.flashStatus(`Quick search: "${kw}"`, 'running');
-    } catch (err) {
-      console.error('[UI] quickSearch error:', err);
-      this.flashStatus('Search failed: ' + err.message, 'error');
-    }
-  }
-
-  async stopJob() {
-    try {
-      await this.sendToBackground({ type: 'STOP_JOB' });
-      this.running = false;
-      this.updateJobUI();
-      this.flashStatus('Job stopped by user', 'error');
-    } catch (err) {
-      console.error('[UI] stopJob error:', err);
-    }
-  }
-
-  async clearResults() {
-    if (!confirm('Clear all extracted results?')) return;
-    try {
-      await this.sendToBackground({ type: 'CLEAR_RESULTS' });
-      this.results = [];
-      this.renderResults();
-      this.flashStatus('Results cleared', 'success');
-    } catch (err) {
-      console.error('[UI] clearResults error:', err);
-    }
-  }
-
-  async clearHistory() {
-    if (!confirm('Clear all job history?')) return;
-    try {
-      await this.sendToBackground({ type: 'CLEAR_HISTORY' });
-      this.history = [];
-      this.renderHistory();
-      this.flashStatus('History cleared', 'success');
-    } catch (err) {
-      console.error('[UI] clearHistory error:', err);
-    }
-  }
-
-  updateJobUI() {
-    const btnStart = this.$('#btnStartBatch');
-    const btnQuick = this.$('#btnQuickSearch');
-    const btnStop = this.$('#btnStopJob');
-    if (this.running) {
-      btnStart.disabled = true;
-      btnQuick.disabled = true;
-      btnStop.disabled = false;
-      this.$('#progressWrap').classList.remove('hidden');
+    if (isRunning) {
+      setStatus('running', 'Scraping');
+      startRuntimeClock();
     } else {
-      btnStart.disabled = false;
-      btnQuick.disabled = false;
-      btnStop.disabled = true;
+      stopRuntimeClock();
     }
   }
 
-  renderResults() {
-    const container = this.$('#resultsTable');
-    const count = this.$('#resultCount');
-    if (!container) return;
-    count.textContent = this.results.length;
-    if (!this.results.length) {
-      container.innerHTML = `
+  function startRuntimeClock() {
+    stopRuntimeClock();
+    runtimeTimer = setInterval(() => {
+      const meta = window.__sleMeta;
+      if (!meta || !meta.startTime) return;
+      const elapsed = Date.now() - meta.startTime;
+      el.statRuntime.textContent = formatRuntime(elapsed);
+    }, 1000);
+  }
+
+  function stopRuntimeClock() {
+    if (runtimeTimer) {
+      clearInterval(runtimeTimer);
+      runtimeTimer = null;
+    }
+  }
+
+  function formatRuntime(ms) {
+    const totalSec = Math.floor(ms / 1000);
+    const min = Math.floor(totalSec / 60);
+    const sec = totalSec % 60;
+    return `${min}:${sec.toString().padStart(2, '0')}`;
+  }
+
+  // ---------------------------------------------------------------------
+  // Results rendering
+  // ---------------------------------------------------------------------
+
+  function escapeHtml(str) {
+    const div = document.createElement('div');
+    div.textContent = str ?? '';
+    return div.innerHTML;
+  }
+
+  function renderResults(results) {
+    cachedResults = results || [];
+    el.resultsCount.textContent = `${cachedResults.length} link${cachedResults.length === 1 ? '' : 's'}`;
+    el.resultsTabCount.textContent = String(cachedResults.length);
+    el.statLinks.textContent = String(cachedResults.length);
+
+    if (cachedResults.length === 0) {
+      el.resultsList.innerHTML = `
         <div class="empty-state">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="10"/><path d="M8 12h8M12 8v8"/></svg>
-          <p>No data yet. Run a search to populate results.</p>
+          <p>No links extracted yet.</p>
+          <span>Run an extraction from the Extract tab to populate this list.</span>
         </div>`;
       return;
     }
-    const frag = document.createDocumentFragment();
-    this.results.slice().reverse().forEach(r => {
-      const row = document.createElement('div');
-      row.className = 'result-row';
-      const tags = [];
-      if (r.emails?.length) tags.push(`<span class="result-tag email">✉ ${r.emails.length}</span>`);
-      if (r.phones?.length) tags.push(`<span class="result-tag phone">☎ ${r.phones.length}</span>`);
-      const socialCount = r.social ? Object.values(r.social).reduce((a, b) => a + b.length, 0) : 0;
-      if (socialCount) tags.push(`<span class="result-tag social">⚡ ${socialCount}</span>`);
-      row.innerHTML = `
-        <div>
-          <a class="result-title" href="${this.escapeAttr(r.url)}" target="_blank" rel="noopener">${this.escapeHTML(r.title)}</a>
-          <div class="result-url">${this.escapeHTML(r.url)}</div>
-          ${r.snippet ? `<div class="result-snippet">${this.escapeHTML(r.snippet)}</div>` : ''}
+
+    // Render most recent first for a "live feed" feel, capped for popup performance
+    const toRender = cachedResults.slice().reverse().slice(0, 300);
+    el.resultsList.innerHTML = toRender.map((r) => `
+      <div class="result-item">
+        <div class="result-item-top">
+          <span class="result-serial">#${r.serial}</span>
+          <span class="result-title">${escapeHtml(r.title)}</span>
         </div>
-        <div class="result-meta">
-          <span class="result-tag">${r.engine}</span>
-          ${tags.join('')}
-        </div>`;
-      frag.appendChild(row);
-    });
-    container.innerHTML = '';
-    container.appendChild(frag);
+        <a class="result-url" href="${escapeHtml(r.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(r.url)}</a>
+        ${r.snippet ? `<p class="result-snippet">${escapeHtml(r.snippet)}</p>` : ''}
+      </div>
+    `).join('');
   }
 
-  renderHistory() {
-    const container = this.$('#historyList');
-    if (!container) return;
-    if (!this.history.length) {
-      container.innerHTML = `
+  function renderHistory(history) {
+    if (!history || history.length === 0) {
+      el.historyList.innerHTML = `
         <div class="empty-state">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
-          <p>No past jobs recorded.</p>
+          <p>No history yet.</p>
+          <span>Completed extraction sessions will be logged here.</span>
         </div>`;
       return;
     }
-    const frag = document.createDocumentFragment();
-    this.history.forEach(h => {
-      const item = document.createElement('div');
-      item.className = 'history-item';
-      const started = h.startedAt ? new Date(h.startedAt).toLocaleString() : '—';
-      item.innerHTML = `
-        <div class="history-head">
-          <span class="history-keyword">${this.escapeHTML((h.keywords || []).slice(0, 3).join(', '))}${(h.keywords || []).length > 3 ? ' …' : ''}</span>
-          <span class="history-time">${started}</span>
+
+    el.historyList.innerHTML = history.map((h) => {
+      const date = new Date(h.timestamp);
+      const dateStr = date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+      const timeStr = date.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+      const filterStr = h.domainFilter ? `filter: "${escapeHtml(h.domainFilter)}"` : 'no filter';
+      const reasonMap = {
+        limit_reached: 'page limit reached',
+        no_more_pages: 'no more pages',
+        navigation_error: 'navigation error',
+        unknown: 'completed'
+      };
+      const reasonStr = reasonMap[h.completionReason] || h.completionReason;
+
+      return `
+        <div class="history-item">
+          <div class="history-item-main">
+            <span class="history-item-title">${dateStr} · ${timeStr}</span>
+            <span class="history-item-meta">${h.totalPages} page${h.totalPages === 1 ? '' : 's'} · ${filterStr} · ${reasonStr}</span>
+          </div>
+          <span class="history-item-count">${h.totalUnique}</span>
         </div>
-        <div class="history-stats">
-          <span>Engine: <strong>${h.engine || '—'}</strong></span>
-          <span>Keywords: <strong>${(h.keywords || []).length}</strong></span>
-          <span>Results: <strong>${h.resultsCount || 0}</strong></span>
-          ${h.aborted ? '<span style="color: var(--danger)">Aborted</span>' : ''}
-        </div>`;
-      frag.appendChild(item);
-    });
-    container.innerHTML = '';
-    container.appendChild(frag);
+      `;
+    }).join('');
   }
 
-  listenForUpdates() {
-    try {
-      chrome.runtime.onMessage.addListener((msg) => {
-        try {
-          if (msg.type === 'ENGINE_DETECTED') {
-            const badge = this.$('#engineBadge');
-            const nameEl = this.$('#engineName');
-            if (badge && nameEl && msg.engine) {
-              nameEl.textContent = msg.engine;
-              badge.classList.add('active');
-            }
-          }
-          if (msg.type === 'SCRAPE_PROGRESS' && msg.progress) {
-            const p = msg.progress;
-            if (p.type === 'page_done') {
-              const pct = Math.round((p.page / p.maxPages) * 100);
-              this.$('#progressFill').style.width = pct + '%';
-              this.$('#progressLabel').textContent = `Page ${p.page} / ${p.maxPages} • ${p.found} new`;
-              this.$('#progressPercent').textContent = pct + '%';
-              this.$('#statusText').textContent = `Scraping "${p.keyword}" — page ${p.page}`;
-            } else if (p.type === 'waiting') {
-              this.$('#statusText').textContent = `Waiting ${(p.ms / 1000).toFixed(1)}s (anti-bot)...`;
-            }
-          }
-          if (msg.type === 'KEYWORD_START') {
-            const total = msg.total || 1;
-            const idx = (msg.index || 0) + 1;
-            const pct = Math.round(((idx - 1) / total) * 100);
-            this.$('#progressFill').style.width = pct + '%';
-            this.$('#progressLabel').textContent = `Keyword ${idx} / ${total}`;
-            this.$('#progressPercent').textContent = pct + '%';
-            this.$('#statusText').textContent = `Starting: "${msg.keyword}"`;
-          }
-          if (msg.type === 'KEYWORD_DONE') {
-            this.flashStatus(`✓ "${msg.keyword}" — ${msg.found} new results (total: ${msg.total})`, 'success');
-          }
-          if (msg.type === 'KEYWORD_ERROR') {
-            this.flashStatus(`✗ "${msg.keyword}" — ${msg.error}`, 'error');
-          }
-          if (msg.type === 'JOB_COMPLETE') {
-            this.running = false;
-            this.updateJobUI();
-            this.$('#progressFill').style.width = '100%';
-            this.$('#progressPercent').textContent = '100%';
-            this.$('#statusText').textContent = `Job complete — ${msg.resultsCount} total results`;
-            this.flashStatus(`Job finished: ${msg.resultsCount} results`, 'success');
-            (async () => {
-              const state = await this.sendToBackground({ type: 'GET_STATE' });
-              if (state) {
-                this.results = state.results || [];
-                this.history = state.history || [];
-                this.renderResults();
-                this.renderHistory();
-              }
-            })();
-          }
-          if (msg.type === 'JOB_ERROR') {
-            this.running = false;
-            this.updateJobUI();
-            this.flashStatus('Job error: ' + msg.error, 'error');
-          }
-          if (msg.type === 'JOB_STOPPED') {
-            this.running = false;
-            this.updateJobUI();
-            this.$('#statusText').textContent = 'Job stopped';
-          }
-        } catch (err) {
-          console.warn('[UI] message handler error:', err);
-        }
-      });
-    } catch (err) {
-      console.error('[UI] listener setup error:', err);
+  // ---------------------------------------------------------------------
+  // Progress rendering
+  // ---------------------------------------------------------------------
+
+  const PHASE_LABELS = {
+    waiting: 'Pacing delay — avoiding rate limits…',
+    navigating: 'Navigating to next page…',
+    stopped: 'Stopped by user.',
+    undefined: 'Scraping current page…'
+  };
+
+  function applyMeta(meta) {
+    window.__sleMeta = meta;
+    if (!meta) {
+      setRunningUI(false);
+      setStatus('idle', 'Idle');
+      return;
+    }
+
+    setRunningUI(!!meta.running);
+
+    if (meta.currentPage) el.statPage.textContent = String(meta.currentPage);
+    if (typeof meta.totalUnique === 'number') {
+      el.statLinks.textContent = String(meta.totalUnique);
+    }
+    if (meta.startTime) {
+      const elapsed = (meta.endTime || Date.now()) - meta.startTime;
+      el.statRuntime.textContent = formatRuntime(elapsed);
+    }
+
+    if (meta.running) {
+      el.progressPhase.textContent = PHASE_LABELS[meta.status] || PHASE_LABELS.undefined;
+    } else if (meta.completionReason) {
+      const reasonMap = {
+        limit_reached: 'Done — page limit reached.',
+        no_more_pages: 'Done — reached the last page.',
+        navigation_error: 'Stopped — navigation error occurred.',
+        unknown: 'Extraction finished.'
+      };
+      setStatus('complete', 'Complete');
+      el.progressPhase.textContent = reasonMap[meta.completionReason] || 'Extraction finished.';
+      el.progressPanel.dataset.active = 'true';
     }
   }
 
-  async detectEngine() {
+  // ---------------------------------------------------------------------
+  // Initial load: pull current state from background
+  // ---------------------------------------------------------------------
+
+  async function loadState() {
+    const state = await sendToBackground({ type: 'SLE_POPUP_GET_STATE' });
+    if (!state || !state.ok) return;
+    renderResults(state.results);
+    renderHistory(state.history);
+    applyMeta(state.meta);
+
+    if (state.meta) {
+      el.domainFilter.value = state.meta.domainFilter || '';
+      if (state.meta.maxPages) {
+        el.maxPages.value = state.meta.maxPages;
+        el.maxPagesValue.textContent = state.meta.maxPages;
+      }
+      if (state.meta.minDelayMs) el.delayMin.value = state.meta.minDelayMs;
+      if (state.meta.maxDelayMs) el.delayMax.value = state.meta.maxDelayMs;
+      updateDelayLabel();
+    }
+  }
+
+  async function checkActiveTabContext() {
     try {
       const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
-      if (!tabs[0]) return;
-      const tab = tabs[0];
-      const host = new URL(tab.url || '').hostname.toLowerCase();
-      let engine = null;
-      if (host.includes('google.')) engine = 'google';
-      else if (host.includes('bing.com')) engine = 'bing';
-      else if (host.includes('yahoo.com') || host.includes('search.yahoo')) engine = 'yahoo';
-      else if (host.includes('duckduckgo.com')) engine = 'duckduckgo';
-      if (engine) {
-        const badge = this.$('#engineBadge');
-        const nameEl = this.$('#engineName');
-        if (badge && nameEl) {
-          nameEl.textContent = engine;
-          badge.classList.add('active');
-        }
+      const tab = tabs && tabs[0];
+      const onSearch = !!(tab && tab.url && /^https:\/\/www\.google\.[a-z.]+\/search/i.test(tab.url));
+      el.contextWarning.hidden = onSearch;
+      if (!onSearch) {
+        el.ctaBtn.disabled = true;
+      } else {
+        el.ctaBtn.disabled = false;
       }
-    } catch (err) {
-      console.warn('[UI] detectEngine error:', err);
+    } catch (_) {
+      // tabs permission should always be available here; fail open
     }
   }
 
-  flashStatus(text, kind = 'idle') {
-    try {
-      const dot = this.$('#jobStatus .status-dot');
-      const label = this.$('#statusText');
-      if (dot) {
-        dot.classList.remove('idle', 'running', 'success', 'error');
-        dot.classList.add(kind);
-      }
-      if (label) label.textContent = text;
-    } catch (err) {
-      console.warn('[UI] flashStatus error:', err);
-    }
-  }
+  // ---------------------------------------------------------------------
+  // Live updates pushed from background while popup is open
+  // ---------------------------------------------------------------------
 
-  sendToBackground(msg) {
-    return new Promise((resolve, reject) => {
-      try {
-        chrome.runtime.sendMessage(msg, (response) => {
-          if (chrome.runtime.lastError) {
-            reject(new Error(chrome.runtime.lastError.message));
-          } else {
-            resolve(response);
-          }
+  chrome.runtime.onMessage.addListener((message) => {
+    if (!message || !message.type) return;
+
+    switch (message.type) {
+      case 'SLE_PROGRESS_RELAY': {
+        // Merge partial progress payload into our cached meta view
+        const merged = Object.assign({}, window.__sleMeta || {}, message.payload);
+        applyMeta(merged);
+        break;
+      }
+      case 'SLE_RESULTS_UPDATED_RELAY': {
+        // Re-pull authoritative results from background storage
+        sendToBackground({ type: 'SLE_POPUP_GET_STATE' }).then((state) => {
+          if (state && state.ok) renderResults(state.results);
         });
-      } catch (err) {
-        reject(err);
+        break;
       }
+      case 'SLE_SCRAPE_COMPLETE_RELAY': {
+        loadState();
+        showToast(`Extraction finished — ${message.payload?.totalUnique ?? 0} links collected`, 'success');
+        break;
+      }
+      default:
+        break;
+    }
+  });
+
+  // ---------------------------------------------------------------------
+  // CTA: Start / Stop
+  // ---------------------------------------------------------------------
+
+  el.ctaBtn.addEventListener('click', async () => {
+    const isRunning = el.ctaBtn.dataset.mode === 'stop';
+
+    if (isRunning) {
+      el.ctaBtn.disabled = true;
+      const res = await sendToBackground({ type: 'SLE_POPUP_STOP' });
+      el.ctaBtn.disabled = false;
+      if (res && res.ok) {
+        showToast('Extraction stopped.');
+        loadState();
+      }
+      return;
+    }
+
+    let lo = parseInt(el.delayMin.value, 10);
+    let hi = parseInt(el.delayMax.value, 10);
+    if (lo > hi) [lo, hi] = [hi, lo];
+
+    const payload = {
+      domainFilter: el.domainFilter.value.trim(),
+      maxPages: parseInt(el.maxPages.value, 10) || 10,
+      minDelayMs: lo,
+      maxDelayMs: hi
+    };
+
+    el.ctaBtn.disabled = true;
+    const res = await sendToBackground({ type: 'SLE_POPUP_START', payload });
+    el.ctaBtn.disabled = false;
+
+    if (!res || !res.ok) {
+      const reason = res && res.error === 'NOT_ON_GOOGLE_SEARCH'
+        ? 'Open a Google Search results page first.'
+        : 'Could not start extraction. Try reloading the Google Search tab.';
+      showToast(reason, 'error');
+      return;
+    }
+
+    setStatus('running', 'Scraping');
+    setRunningUI(true);
+    window.__sleMeta = { running: true, startTime: Date.now(), currentPage: 1, totalUnique: 0 };
+    el.statPage.textContent = '1';
+    el.statLinks.textContent = '0';
+    el.progressPhase.textContent = 'Scraping current page…';
+  });
+
+  // ---------------------------------------------------------------------
+  // Export: CSV
+  // ---------------------------------------------------------------------
+
+  function csvEscape(value) {
+    const str = String(value ?? '');
+    if (/[",\n]/.test(str)) {
+      return `"${str.replace(/"/g, '""')}"`;
+    }
+    return str;
+  }
+
+  function buildCsv(results) {
+    const header = ['Serial', 'URL', 'Title', 'Description'];
+    const rows = results.map((r) => [r.serial, r.url, r.title, r.snippet || ''].map(csvEscape).join(','));
+    return [header.join(','), ...rows].join('\r\n');
+  }
+
+  function downloadBlob(content, filename, mime) {
+    const blob = new Blob([content], { type: mime });
+    const url = URL.createObjectURL(blob);
+    chrome.downloads.download(
+      { url, filename, saveAs: false },
+      () => URL.revokeObjectURL(url)
+    );
+  }
+
+  function timestampForFilename() {
+    const d = new Date();
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}`;
+  }
+
+  el.exportCsv.addEventListener('click', () => {
+    if (cachedResults.length === 0) {
+      showToast('No results to export yet.', 'error');
+      return;
+    }
+    const csv = buildCsv(cachedResults);
+    downloadBlob(csv, `link-extractor-${timestampForFilename()}.csv`, 'text/csv;charset=utf-8;');
+    showToast('CSV export started.', 'success');
+  });
+
+  el.exportJson.addEventListener('click', () => {
+    if (cachedResults.length === 0) {
+      showToast('No results to export yet.', 'error');
+      return;
+    }
+    const json = JSON.stringify(cachedResults, null, 2);
+    downloadBlob(json, `link-extractor-${timestampForFilename()}.json`, 'application/json;charset=utf-8;');
+    showToast('JSON export started.', 'success');
+  });
+
+  // ---------------------------------------------------------------------
+  // TXT Export Functionality
+  // ---------------------------------------------------------------------
+  function buildTxt(results) {
+    let textContent = "==================================================\n";
+    textContent += "        SEARCH LINK EXTRACTOR REPORT\n";
+    textContent += `        Total Links Extracted: ${results.length}\n`;
+    textContent += "==================================================\n\n";
+
+    results.forEach((item) => {
+      textContent += `Serial No  : ${item.serial}\n`;
+      textContent += `Title      : ${item.title || 'No Title'}\n`;
+      textContent += `URL        : ${item.url}\n`;
+      textContent += `Description: ${item.snippet || 'No Description'}\n`;
+      textContent += "--------------------------------------------------\n";
+    });
+
+    return textContent;
+  }
+
+  el.exportTxt.addEventListener('click', () => {
+    if (cachedResults.length === 0) {
+      showToast('No results to export yet.', 'error');
+      return;
+    }
+    const txtContent = buildTxt(cachedResults);
+    downloadBlob(txtContent, `link-extractor-${timestampForFilename()}.txt`, 'text/plain;charset=utf-8;');
+    showToast('TXT export started.', 'success');
+  });
+
+  el.clearResults.addEventListener('click', async () => {
+    const res = await sendToBackground({ type: 'SLE_POPUP_CLEAR' });
+    if (res && res.ok) {
+      renderResults([]);
+      showToast('Results cleared.');
+    }
+  });
+
+  el.clearHistory.addEventListener('click', async () => {
+    await chrome.storage.local.set({ sle_history: [] });
+    renderHistory([]);
+    showToast('History cleared.');
+  });
+
+  // ---------------------------------------------------------------------
+  // Init
+  // ---------------------------------------------------------------------
+
+  (async function init() {
+    updateDelayLabel();
+    await checkActiveTabContext();
+    await loadState();
+  })();
+
+  // ---------------------------------------------------------------------
+  // Footer Dynamic Tooltip / Popup Window on Hover
+  // ---------------------------------------------------------------------
+  const footerElement = document.getElementById('dedicationFooter');
+  const tooltipElement = document.getElementById('footerTooltip');
+
+  if (footerElement && tooltipElement) {
+    // মাউস ফুটারে প্রবেশ করলে পপআপ দেখাবে
+    footerElement.addEventListener('mouseenter', () => {
+      tooltipElement.classList.add('active');
+    });
+
+    // মাউস ফুটার থেকে চলে গেলে পপআপ লুকিয়ে যাবে
+    footerElement.addEventListener('mouseleave', () => {
+      tooltipElement.classList.remove('active');
+    });
+
+    // মাউস ফুটারের ওপর নড়াচড়া করলে পপআপটি মাউসের সাথে সাথে সরবে
+    footerElement.addEventListener('mousemove', (e) => {
+      // মাউসের স্থানাঙ্ক (Coordinates) বের করা হচ্ছে
+      const mouseX = e.clientX;
+      const mouseY = e.clientY;
+
+      // পপআপটি মাউসের ঠিক নিচে এবং ডানপাশে একটু সরিয়ে রাখার জন্য (+15, -60 ইত্যাদি) অফসেট ব্যবহার করা হয়েছে
+      tooltipElement.style.left = (mouseX + 12) + 'px';
+      tooltipElement.style.top = (mouseY - 65) + 'px'; // মাউসের কিছুটা উপরে দেখাবে
     });
   }
-
-  escapeHTML(str) {
-    if (str === null || str === undefined) return '';
-    return String(str)
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;')
-      .replace(/'/g, '&#39;');
-  }
-
-  escapeAttr(str) {
-    return this.escapeHTML(str);
-  }
-}
-
-document.addEventListener('DOMContentLoaded', () => {
-  try {
-    new UIController();
-  } catch (err) {
-    console.error('[UI] bootstrap error:', err);
-  }
-});
+})();

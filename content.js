@@ -1,359 +1,417 @@
-/* ============================================================
-   CONTENT SCRIPT — ScraperEngine
-   Injected into search engine pages. Handles DOM scraping,
-   pagination, data enrichment, and filtering.
-   ============================================================ */
+/**
+ * content.js
+ * Injected into https://www.google.com/search* pages.
+ *
+ * Responsibilities:
+ *  - Parse the current SERP for result items (URL, title, snippet)
+ *  - Clean tracking/redirect wrapper URLs into final destination URLs
+ *  - Apply domain/pattern filtering + internal-Google exclusion
+ *  - Deduplicate using a Set keyed on normalized URL
+ *  - Auto-paginate by locating and clicking the "Next" control
+ *  - Respect a randomized human-like delay between page transitions
+ *  - Report progress + results back to background.js via chrome.runtime messaging
+ *
+ * Defensive design: every DOM query is guarded. If Google changes a class name,
+ * we fall back to alternate selectors and skip cleanly rather than throwing.
+ */
 
-'use strict';
+(() => {
+  'use strict';
 
-class DataEnricher {
-  constructor() {
-    this.regex = {
-      email: /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g,
-      phone: /(?:\+?\d{1,3}[-.\s]?)?\(?\d{2,4}\)?[-.\s]?\d{3,4}[-.\s]?\d{3,4}/g,
-      social: {
-        facebook:  /(?:https?:\/\/)?(?:www\.)?facebook\.com\/[A-Za-z0-9_.]+/gi,
-        twitter:   /(?:https?:\/\/)?(?:www\.)?(?:twitter\.com|x\.com)\/[A-Za-z0-9_]+/gi,
-        linkedin:  /(?:https?:\/\/)?(?:www\.)?linkedin\.com\/(?:in|company)\/[A-Za-z0-9_\-]+/gi,
-        instagram: /(?:https?:\/\/)?(?:www\.)?instagram\.com\/[A-Za-z0-9_.]+/gi
-      }
-    };
+  // Guard against double-injection (Chrome can re-run content scripts on SPA-like navigations)
+  if (window.__SLE_CONTENT_LOADED__) {
+    return;
   }
+  window.__SLE_CONTENT_LOADED__ = true;
 
-  enrich(text) {
-    if (!text || typeof text !== 'string') return { emails: [], phones: [], social: {} };
-    const clean = text.replace(/\s+/g, ' ').trim();
-    const emails = [...new Set((clean.match(this.regex.email) || []).map(e => e.toLowerCase()))];
-    const phones = [...new Set((clean.match(this.regex.phone) || [])
-      .filter(p => p.replace(/\D/g, '').length >= 7 && p.replace(/\D/g, '').length <= 15))];
-    const social = {};
-    for (const [platform, re] of Object.entries(this.regex.social)) {
-      const matches = [...new Set((clean.match(re) || []).map(s => s.trim()))];
-      if (matches.length) social[platform] = matches;
+  // ---------------------------------------------------------------------
+  // Constants & State
+  // ---------------------------------------------------------------------
+
+  const SELECTORS = {
+    // Result containers - Google has used several over time; try each in order.
+    resultContainers: [
+      'div.g',
+      'div.tF2Cxc',
+      'div.Gx5Zad',
+      'div[data-sokoban-container]',
+      'div.MjjYud'
+    ],
+    titleNode: ['h3'],
+    linkNode: ['a[href]'],
+    snippetNode: [
+      'div.VwiC3b',
+      'span.aCOpRe',
+      'div.IsZvec',
+      'div[data-sncf="1"]',
+      'div.s'
+    ],
+    nextButton: [
+      '#pnnext',
+      'a#pnnext',
+      'a[aria-label="Next page"]',
+      'a[aria-label="Next"]'
+    ]
+  };
+
+  const GOOGLE_INTERNAL_HOST_PATTERNS = [
+    /^https?:\/\/(www\.)?google\.[a-z.]+\/(search|maps|imgres|shopping|preferences|intl|accounts|advanced_search|url)/i,
+    /^https?:\/\/maps\.google\./i,
+    /^https?:\/\/accounts\.google\./i,
+    /^https?:\/\/support\.google\./i,
+    /^https?:\/\/policies\.google\./i,
+    /^https?:\/\/webcache\.googleusercontent\.com/i,
+    /^https?:\/\/translate\.google\./i
+  ];
+
+  let state = {
+    running: false,
+    paused: false,
+    currentPage: 1,
+    maxPages: 10,
+    minDelayMs: 1500,
+    maxDelayMs: 3500,
+    domainFilter: '',
+    seenUrls: new Set(),
+    startTime: null
+  };
+
+  // ---------------------------------------------------------------------
+  // Helpers
+  // ---------------------------------------------------------------------
+
+  /** Try a list of selectors against a root element, return first match or null. */
+  function queryFirst(root, selectorList) {
+    for (const sel of selectorList) {
+      try {
+        const el = root.querySelector(sel);
+        if (el) return el;
+      } catch (_) {
+        // Invalid selector in this Chrome version - skip
+      }
     }
-    return { emails, phones, social };
-  }
-}
-
-class FilterEngine {
-  constructor(config = {}) {
-    this.blacklist = (config.blacklist || []).map(d => d.toLowerCase().trim()).filter(Boolean);
-    this.requiredKeywords = (config.requiredKeywords || []).map(k => k.toLowerCase().trim()).filter(Boolean);
-    this.dedup = config.dedup !== false;
-    this.seen = new Set();
-  }
-
-  passes(url, title, snippet) {
-    try {
-      const host = new URL(url).hostname.toLowerCase().replace(/^www\./, '');
-      for (const domain of this.blacklist) {
-        if (host === domain || host.endsWith('.' + domain)) return false;
-      }
-      if (this.requiredKeywords.length) {
-        const hay = ((title || '') + ' ' + (snippet || '')).toLowerCase();
-        const ok = this.requiredKeywords.some(kw => hay.includes(kw));
-        if (!ok) return false;
-      }
-      if (this.dedup) {
-        const key = url.toLowerCase().replace(/\/$/, '');
-        if (this.seen.has(key)) return false;
-        this.seen.add(key);
-      }
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  reset() { this.seen.clear(); }
-}
-
-class ScraperEngine {
-  constructor() {
-    this.enricher = new DataEnricher();
-    this.filter = null;
-    this.engine = null;
-    this.config = {};
-    this.currentPage = 0;
-    this.maxPages = 5;
-    this.results = [];
-    this.running = false;
-    this.selectors = {
-      google: {
-        results: '#search .g, #rso .g',
-        title: 'h3',
-        link: 'a[href^="http"]',
-        snippet: '[data-sncf], .VwiC3b, [style*="-webkit-line-clamp"]',
-        next: '#pnnext, a[aria-label="Next"]',
-        searchInput: 'textarea[name="q"], input[name="q"]'
-      },
-      bing: {
-        results: '#b_results > li.b_algo',
-        title: 'h2',
-        link: 'h2 a',
-        snippet: '.b_caption p, .b_algoSlug',
-        next: 'a.sb_pagN, a[title="Next page"]',
-        searchInput: 'input[name="q"], textarea[name="q"]'
-      },
-      yahoo: {
-        results: '#web ol li',
-        title: 'h3.title a, h3 a',
-        link: 'h3.title a, h3 a',
-        snippet: '.compText p, .abstract',
-        next: 'a.next, a[aria-label="Next"]',
-        searchInput: 'input[name="p"], #yschsp'
-      },
-      duckduckgo: {
-        results: 'article[data-testid="result"]',
-        title: 'h2 a[data-testid="result-title-a"]',
-        link: 'h2 a[data-testid="result-title-a"]',
-        snippet: 'div[data-result="snippet"]',
-        next: 'button[data-testid="pagination-next"], a[data-testid="pagination_next"]',
-        searchInput: 'input[name="q"]'
-      }
-    };
-  }
-
-  detectEngine() {
-    const host = location.hostname.toLowerCase();
-    if (host.includes('google.')) return 'google';
-    if (host.includes('bing.com')) return 'bing';
-    if (host.includes('yahoo.com') || host.includes('search.yahoo')) return 'yahoo';
-    if (host.includes('duckduckgo.com')) return 'duckduckgo';
     return null;
   }
 
-  init(config = {}) {
-    this.config = config;
-    this.engine = config.engine === 'auto' ? this.detectEngine() : config.engine;
-    if (!this.engine) throw new Error('Unsupported or undetected search engine.');
-    this.maxPages = parseInt(config.maxPages, 10) || 5;
-    this.currentPage = 0;
-    this.results = [];
-    this.running = true;
-    this.filter = new FilterEngine({
-      blacklist: (config.blacklist || '').split(',').map(s => s.trim()).filter(Boolean),
-      requiredKeywords: (config.requiredKeywords || '').split(',').map(s => s.trim()).filter(Boolean),
-      dedup: config.dedup !== false
-    });
-    return this.engine;
-  }
-
-  extractFromDOM() {
-    const sel = this.selectors[this.engine];
-    if (!sel) return [];
-    const nodes = document.querySelectorAll(sel.results);
-    const pageResults = [];
-    nodes.forEach(node => {
+  /** Find all result containers using fallback selector list. */
+  function findResultContainers() {
+    for (const sel of SELECTORS.resultContainers) {
       try {
-        const titleEl = node.querySelector(sel.title);
-        const linkEl = node.querySelector(sel.link);
-        const snippetEl = node.querySelector(sel.snippet);
-        if (!titleEl || !linkEl) return;
-        const title = (titleEl.textContent || '').trim();
-        let url = linkEl.getAttribute('href') || '';
-        if (this.engine === 'google') {
-          const real = linkEl.getAttribute('data-href') || linkEl.getAttribute('href');
-          if (real && !real.startsWith('http')) {
-            const m = real.match(/[?&]q=(https?[^&]+)/);
-            if (m) url = decodeURIComponent(m[1]);
-          } else if (real && real.startsWith('http') && !real.includes('google.')) {
-            url = real;
-          } else if (real && real.startsWith('/url?')) {
-            const m = real.match(/[?&]q=(https?[^&]+)/);
-            if (m) url = decodeURIComponent(m[1]);
-          }
+        const nodes = document.querySelectorAll(sel);
+        if (nodes && nodes.length > 0) {
+          return Array.from(nodes);
         }
-        if (!url || !/^https?:\/\//i.test(url)) return;
-        const snippet = (snippetEl ? snippetEl.textContent : '').trim();
-        const combinedText = `${title} ${snippet}`;
-        const enrichment = this.config.enrich ? this.enricher.enrich(combinedText) : { emails: [], phones: [], social: {} };
-        if (!this.filter.passes(url, title, snippet)) return;
-        pageResults.push({
-          id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-          title: title || '(No title)',
-          url,
-          snippet: snippet || '',
-          engine: this.engine,
-          page: this.currentPage + 1,
-          keyword: this.config.currentKeyword || '',
-          extractedAt: new Date().toISOString(),
-          emails: enrichment.emails,
-          phones: enrichment.phones,
-          social: enrichment.social
-        });
+      } catch (_) {
+        // skip invalid selector
+      }
+    }
+    return [];
+  }
+
+  /**
+   * Clean a raw href pulled from a Google SERP anchor.
+   * Handles:
+   *  - Direct destination links (most common in modern Google markup)
+   *  - /url?q=<dest>&sa=...  legacy redirect wrapper
+   *  - /interstitial?url=<dest>
+   * Returns null if the URL should be discarded (internal Google page, javascript:, etc).
+   */
+  function cleanUrl(rawHref) {
+    if (!rawHref || typeof rawHref !== 'string') return null;
+    if (rawHref.startsWith('#') || rawHref.startsWith('javascript:')) return null;
+
+    let absolute;
+    try {
+      absolute = new URL(rawHref, window.location.origin);
+    } catch (_) {
+      return null;
+    }
+
+    // Unwrap Google's /url? redirect wrapper
+    if (absolute.pathname === '/url' || absolute.pathname === '/interstitial') {
+      const wrapped = absolute.searchParams.get('q') || absolute.searchParams.get('url');
+      if (wrapped) {
+        try {
+          absolute = new URL(wrapped);
+        } catch (_) {
+          return null;
+        }
+      }
+    }
+
+    const finalHref = absolute.href;
+
+    // Exclude internal Google system links
+    for (const pattern of GOOGLE_INTERNAL_HOST_PATTERNS) {
+      if (pattern.test(finalHref)) return null;
+    }
+
+    // Exclude anything that isn't http/https (mailto:, tel:, etc.)
+    if (absolute.protocol !== 'http:' && absolute.protocol !== 'https:') return null;
+
+    return finalHref;
+  }
+
+  /** Normalize a URL for dedup purposes (strip trailing slash, fragment, common tracking params). */
+  function normalizeForDedup(url) {
+    try {
+      const u = new URL(url);
+      u.hash = '';
+      const stripParams = ['utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content', 'fbclid', 'gclid'];
+      stripParams.forEach((p) => u.searchParams.delete(p));
+      let normalized = u.toString();
+      if (normalized.endsWith('/')) normalized = normalized.slice(0, -1);
+      return normalized.toLowerCase();
+    } catch (_) {
+      return url.toLowerCase();
+    }
+  }
+
+  /** Check whether a URL passes the user-supplied domain/pattern filter. */
+  function matchesDomainFilter(url, filterRaw) {
+    if (!filterRaw) return true;
+    const filter = filterRaw.trim().toLowerCase();
+    if (!filter) return true;
+    // Support comma-separated list of patterns; match if ANY pattern is contained in the URL.
+    const patterns = filter.split(',').map((p) => p.trim()).filter(Boolean);
+    if (patterns.length === 0) return true;
+    const lowerUrl = url.toLowerCase();
+    return patterns.some((p) => lowerUrl.includes(p));
+  }
+
+  /** Extract title + snippet + cleaned URL for one result container. */
+  function extractResult(container) {
+    const linkEl = queryFirst(container, SELECTORS.linkNode);
+    if (!linkEl) return null;
+
+    const rawHref = linkEl.getAttribute('href');
+    const cleaned = cleanUrl(rawHref);
+    if (!cleaned) return null;
+
+    const titleEl = queryFirst(container, SELECTORS.titleNode);
+    const title = titleEl ? titleEl.textContent.trim() : '(No title found)';
+
+    const snippetEl = queryFirst(container, SELECTORS.snippetNode);
+    const snippet = snippetEl ? snippetEl.textContent.trim() : '';
+
+    return { url: cleaned, title, snippet };
+  }
+
+  /** Scrape the currently loaded SERP DOM and return an array of new (deduped, filtered) results. */
+  function scrapeCurrentPage() {
+    const containers = findResultContainers();
+    const newResults = [];
+
+    for (const container of containers) {
+      try {
+        const result = extractResult(container);
+        if (!result) continue;
+
+        const dedupKey = normalizeForDedup(result.url);
+        if (state.seenUrls.has(dedupKey)) continue;
+
+        if (!matchesDomainFilter(result.url, state.domainFilter)) continue;
+
+        state.seenUrls.add(dedupKey);
+        newResults.push(result);
       } catch (err) {
-        console.warn('[SLEP] node parse error:', err);
+        // Never let one malformed result kill the whole scrape
+        console.warn('[SLE] Skipped a malformed result node:', err);
+      }
+    }
+
+    return newResults;
+  }
+
+  /** Locate the "Next" pagination control on the current SERP. */
+  function findNextButton() {
+    return queryFirst(document, SELECTORS.nextButton);
+  }
+
+  /** Random delay between minDelayMs and maxDelayMs, resolved as a Promise. */
+  function humanDelay() {
+    const { minDelayMs, maxDelayMs } = state;
+    const lo = Math.min(minDelayMs, maxDelayMs);
+    const hi = Math.max(minDelayMs, maxDelayMs);
+    const ms = lo + Math.random() * (hi - lo);
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  /** Send a progress/status update to the popup via background relay. */
+  function reportProgress(extra = {}) {
+    chrome.runtime.sendMessage({
+      type: 'SLE_PROGRESS',
+      payload: {
+        currentPage: state.currentPage,
+        totalUnique: state.seenUrls.size,
+        running: state.running,
+        ...extra
+      }
+    }).catch(() => {
+      // Popup may be closed - this is expected and harmless.
+    });
+  }
+
+  /** Send a completed batch of results for this page to background for storage/aggregation. */
+  function sendResultsBatch(results) {
+    if (results.length === 0) return Promise.resolve();
+    return chrome.runtime.sendMessage({
+      type: 'SLE_RESULTS_BATCH',
+      payload: { results, page: state.currentPage }
+    }).catch(() => {});
+  }
+
+  /**
+   * Main scrape loop: scrape page -> report -> wait -> click next -> repeat.
+   * Stops when: max pages reached, no next button found, or user requested stop.
+   */
+  async function runScrapeLoop() {
+    while (state.running) {
+      const pageResults = scrapeCurrentPage();
+      await sendResultsBatch(pageResults);
+      reportProgress({ lastPageCount: pageResults.length });
+
+      if (!state.running) break;
+
+      if (state.currentPage >= state.maxPages) {
+        finishScrape('limit_reached');
+        return;
+      }
+
+      const nextBtn = findNextButton();
+      if (!nextBtn) {
+        finishScrape('no_more_pages');
+        return;
+      }
+
+      // Human-like pacing before navigating to reduce anti-bot trigger likelihood
+      reportProgress({ status: 'waiting' });
+      await humanDelay();
+
+      if (!state.running) break;
+
+      state.currentPage += 1;
+      reportProgress({ status: 'navigating' });
+
+      try {
+        nextBtn.click();
+      } catch (err) {
+        finishScrape('navigation_error');
+        return;
+      }
+
+      // The click triggers a full page navigation on classic Google SERPs,
+      // which destroys this content script context. We return here; if the
+      // navigation actually happens, the freshly injected script picks up
+      // the in-progress job from chrome.storage.local (see init()).
+      return;
+    }
+  }
+
+  function finishScrape(reason) {
+    state.running = false;
+    chrome.runtime.sendMessage({
+      type: 'SLE_SCRAPE_COMPLETE',
+      payload: { reason, totalUnique: state.seenUrls.size, totalPages: state.currentPage }
+    }).catch(() => {});
+    chrome.storage.local.remove('sle_active_job').catch(() => {});
+  }
+
+  // ---------------------------------------------------------------------
+  // Job persistence across page navigations
+  // ---------------------------------------------------------------------
+
+  async function persistJob() {
+    await chrome.storage.local.set({
+      sle_active_job: {
+        running: state.running,
+        currentPage: state.currentPage,
+        maxPages: state.maxPages,
+        minDelayMs: state.minDelayMs,
+        maxDelayMs: state.maxDelayMs,
+        domainFilter: state.domainFilter,
+        seenUrls: Array.from(state.seenUrls),
+        startTime: state.startTime
       }
     });
-    return pageResults;
   }
 
-  hasNextButton() {
-    const sel = this.selectors[this.engine];
-    if (!sel || !sel.next) return false;
-    const btn = document.querySelector(sel.next);
-    return !!btn && btn.offsetParent !== null;
-  }
-
-  clickNext() {
-    const sel = this.selectors[this.engine];
-    if (!sel || !sel.next) return false;
-    const btn = document.querySelector(sel.next);
-    if (btn) {
-      try {
-        btn.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        btn.click();
-        return true;
-      } catch (err) {
-        console.warn('[SLEP] next click error:', err);
-        return false;
-      }
+  async function loadJobIfActive() {
+    const data = await chrome.storage.local.get('sle_active_job');
+    const job = data && data.sle_active_job;
+    if (job && job.running) {
+      state.running = true;
+      state.currentPage = job.currentPage || 1;
+      state.maxPages = job.maxPages || 10;
+      state.minDelayMs = job.minDelayMs ?? 1500;
+      state.maxDelayMs = job.maxDelayMs ?? 3500;
+      state.domainFilter = job.domainFilter || '';
+      state.seenUrls = new Set(job.seenUrls || []);
+      state.startTime = job.startTime || Date.now();
+      return true;
     }
     return false;
   }
 
-  async injectKeyword(keyword) {
-    const sel = this.selectors[this.engine];
-    if (!sel || !sel.searchInput) return false;
-    const input = document.querySelector(sel.searchInput);
-    if (!input) return false;
-    try {
-      input.focus();
-      input.value = keyword;
-      input.dispatchEvent(new Event('input', { bubbles: true }));
-      input.dispatchEvent(new Event('change', { bubbles: true }));
-      const form = input.closest('form');
-      if (form) {
-        form.submit();
-      } else {
-        input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
-        input.dispatchEvent(new KeyboardEvent('keypress', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
-        input.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
+  // ---------------------------------------------------------------------
+  // Message handling (commands from popup via background)
+  // ---------------------------------------------------------------------
+
+  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (!message || !message.type) return;
+
+    switch (message.type) {
+      case 'SLE_START_SCRAPE': {
+        const cfg = message.payload || {};
+        state.running = true;
+        state.currentPage = 1;
+        state.maxPages = cfg.maxPages || 10;
+        state.minDelayMs = cfg.minDelayMs ?? 1500;
+        state.maxDelayMs = cfg.maxDelayMs ?? 3500;
+        state.domainFilter = cfg.domainFilter || '';
+        state.seenUrls = new Set();
+        state.startTime = Date.now();
+        persistJob().then(() => runScrapeLoop());
+        sendResponse({ ok: true });
+        break;
       }
-      return true;
-    } catch (err) {
-      console.warn('[SLEP] inject keyword error:', err);
-      return false;
-    }
-  }
-
-  async scrapeCurrentPage() {
-    const pageResults = this.extractFromDOM();
-    this.results.push(...pageResults);
-    this.currentPage++;
-    return {
-      page: this.currentPage,
-      found: pageResults.length,
-      total: this.results.length
-    };
-  }
-
-  async runFullScrape(onProgress) {
-    const results = [];
-    try {
-      while (this.running && this.currentPage < this.maxPages) {
-        const summary = await this.scrapeCurrentPage();
-        results.push(...this.results.slice(this.results.length - summary.found));
-        if (onProgress) {
-          onProgress({
-            type: 'page_done',
-            page: summary.page,
-            maxPages: this.maxPages,
-            found: summary.found,
-            total: summary.total,
-            keyword: this.config.currentKeyword
-          });
-        }
-        if (this.currentPage >= this.maxPages) break;
-        if (!this.hasNextButton()) break;
-        const delay = this.randomDelay();
-        if (onProgress) {
-          onProgress({ type: 'waiting', ms: delay, reason: 'anti-bot delay' });
-        }
-        await this.sleep(delay);
-        if (!this.running) break;
-        if (!this.clickNext()) break;
-        await this.sleep(1500);
+      case 'SLE_STOP_SCRAPE': {
+        state.running = false;
+        chrome.storage.local.remove('sle_active_job').catch(() => {});
+        reportProgress({ status: 'stopped' });
+        sendResponse({ ok: true });
+        break;
       }
-      return { success: true, results: this.results, keyword: this.config.currentKeyword };
-    } catch (err) {
-      console.error('[SLEP] scrape error:', err);
-      return { success: false, error: err.message, results: this.results };
+      case 'SLE_PING': {
+        sendResponse({ ok: true, onGoogleSearch: true });
+        break;
+      }
+      default:
+        break;
+    }
+  });
+
+  // Keep persisted job state fresh as we go (covers the brief window before navigation)
+  const persistInterval = setInterval(() => {
+    if (state.running) persistJob();
+  }, 1000);
+
+  window.addEventListener('beforeunload', () => {
+    clearInterval(persistInterval);
+    if (state.running) persistJob();
+  });
+
+  // ---------------------------------------------------------------------
+  // Init: resume an in-progress job after a pagination navigation
+  // ---------------------------------------------------------------------
+
+  async function init() {
+    const resumed = await loadJobIfActive();
+    if (resumed) {
+      // Give the new SERP a brief moment to finish rendering before we scrape.
+      setTimeout(() => runScrapeLoop(), 400);
     }
   }
 
-  randomDelay() {
-    const min = parseInt(this.config.delayMin, 10) || 2000;
-    const max = parseInt(this.config.delayMax, 10) || 4500;
-    return Math.floor(Math.random() * (max - min + 1)) + min;
-  }
-
-  sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
-  }
-
-  stop() { this.running = false; }
-}
-
-/* ============================================================
-   MESSAGE LISTENER — bridges background <-> content
-   ============================================================ */
-const engine = new ScraperEngine();
-
-chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  try {
-    if (msg.type === 'PING') {
-      sendResponse({ ok: true, engine: engine.detectEngine() });
-      return true;
-    }
-    if (msg.type === 'START_SCRAPE') {
-      (async () => {
-        try {
-          const detected = engine.init(msg.config || {});
-          chrome.runtime.sendMessage({
-            type: 'ENGINE_DETECTED',
-            engine: detected,
-            keyword: msg.config?.currentKeyword
-          }).catch(() => {});
-          const result = await engine.runFullScrape((progress) => {
-            chrome.runtime.sendMessage({ type: 'SCRAPE_PROGRESS', progress }).catch(() => {});
-          });
-          sendResponse(result);
-        } catch (err) {
-          sendResponse({ success: false, error: err.message, results: [] });
-        }
-      })();
-      return true;
-    }
-    if (msg.type === 'INJECT_KEYWORD') {
-      (async () => {
-        try {
-          const ok = await engine.injectKeyword(msg.keyword);
-          sendResponse({ ok });
-        } catch (err) {
-          sendResponse({ ok: false, error: err.message });
-        }
-      })();
-      return true;
-    }
-    if (msg.type === 'STOP_SCRAPE') {
-      engine.stop();
-      sendResponse({ ok: true });
-      return true;
-    }
-    if (msg.type === 'GET_ENGINE') {
-      sendResponse({ engine: engine.detectEngine() });
-      return true;
-    }
-  } catch (err) {
-    console.error('[SLEP] listener error:', err);
-    sendResponse({ ok: false, error: err.message });
-    return true;
-  }
-});
-
-/* Announce readiness on load */
-try {
-  chrome.runtime.sendMessage({ type: 'CONTENT_READY', engine: engine.detectEngine() }).catch(() => {});
-} catch (_) {}
+  init();
+})();
