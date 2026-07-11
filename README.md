@@ -27,8 +27,7 @@
 ## 📸 User Interface & Screenshots
 
 <div align="center">
-
-  <img src="https://via.placeholder.com/800x400/0d0e12/00d2ff?text=Animated+GIF+of+Extension+Working" alt="Search Link Extractor Pro Working Animation" width="100%" style="border-radius: 12px; box-shadow: 0 8px 24px rgba(0,210,255,0.2);">
+  <img src="https://github.com/user-attachments/assets/b781190a-bc37-4290-af44-1c3185a15a6a" alt="Search Link Extractor Pro Working Animation" width="100%" style="border-radius: 12px; box-shadow: 0 8px 24px rgba(0,210,255,0.2);">
   
   <br><br>
   
@@ -36,11 +35,11 @@
     <tr>
       <td width="50%" align="center">
         <b>Modern Glassmorphism Dashboard</b><br><br>
-        <img src="https://via.placeholder.com/400x500/0d0e12/f3f4f6?text=Dashboard+Screenshot" alt="Dashboard Interface" width="90%" style="border-radius: 8px;">
+        <img src="https://github.com/user-attachments/assets/1812299f-9d5c-494a-b0b6-99c6bea1709d" alt="Dashboard Interface" width="90%" style="border-radius: 8px;">
       </td>
       <td width="50%" align="center">
         <b>Data Export & History Logs</b><br><br>
-        <img src="https://via.placeholder.com/400x500/0d0e12/2bd576?text=Export+Tab+Screenshot" alt="Export Interface" width="90%" style="border-radius: 8px;">
+        <img src="https://github.com/user-attachments/assets/9996c1c1-ec00-45ae-956b-29763d25a4b9" alt="Export Interface" width="90%" style="border-radius: 8px;">
       </td>
     </tr>
   </table>
@@ -112,7 +111,7 @@ Developed strictly following **Object-Oriented Programming (OOP)** principles:
 
 You can easily install this tool locally by downloading it directly from this repository:
 
-1. **Download:** Navigate to the **[Releases](https://github.com/yourusername/Search-Link-Extractor-Pro/releases)** section on the right side of this repository and download the latest `Search-Link-Extractor-Pro.zip` file.
+1. **Download:** Navigate to the **[Releases](https://github.com/mmizan85/Search-Link-Extractor-Pro/releases)** section on the right side of this repository and download the latest `Search-Link-Extractor-Pro.zip` file.
 2. **Extract:** Unzip the downloaded file to a folder on your computer.
 3. **Load to Browser:**
 
